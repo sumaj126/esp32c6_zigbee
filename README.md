@@ -206,13 +206,15 @@ app_main()
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| WiFi 连接 | ✅ | STA 模式，支持重连 |
-| MQTT 连接 | ✅ | 匿名连接宿主机 Mosquitto |
+| WiFi 连接 | ✅ | STA 模式，无限自动重连 |
+| MQTT 连接 | ✅ | 匿名连接宿主机 Mosquitto，自动重连 |
 | ZigBee 协调器 | ✅ | 通道 13，PAN ID 0xf6f5 |
 | HA Discovery | ✅ | 自动在 HAOS 中发现设备 |
 | 状态监控 | ✅ | 显示 online/offline 状态 |
 | LWT 遗嘱消息 | ✅ | 断电后约 15 秒显示 offline |
 | 设备入网公告 | ✅ | 新设备入网时发布 MQTT 消息 |
+| 心跳机制 | ✅ | 每 60 秒发布状态更新 |
+| 诊断信息 | ✅ | 重启原因、运行时间、剩余内存 |
 
 ### MQTT 话题
 
@@ -250,6 +252,34 @@ app_main()
   "icon": "mdi:zigbee"
 }
 ```
+
+### 协调器属性
+
+通过 MQTT 发布的属性信息：
+
+| 属性 | 说明 | 示例值 |
+|------|------|--------|
+| `pan_id` | ZigBee 网络 PAN ID | "0xf6f5" |
+| `channel` | ZigBee 通道 | 13 |
+| `short_addr` | 短地址 | "0x0000" |
+| `ieee` | IEEE 长地址 | "a1b2c3d4e5f6a7b8" |
+| `reset_reason` | 重启原因 | "power_on", "wdt", "panic" |
+| `uptime` | 运行时间 | "02:30:45" |
+| `free_heap` | 剩余内存（字节）| 245760 |
+
+### 重启原因说明
+
+| 值 | 含义 |
+|------|------|
+| power_on | 正常上电启动 |
+| software | 软件调用重启 |
+| panic | 程序崩溃/异常 |
+| wdt | 看门狗超时 |
+| brownout | 电压过低重启 |
+| int_wdt | 中断看门狗超时 |
+| task_wdt | 任务看门狗超时 |
+| deepsleep | 深度睡眠唤醒 |
+| other | 其他原因 |
 
 ## 编译与烧录
 
@@ -366,6 +396,9 @@ mosquitto_sub -h localhost -t 'homeassistant/sensor/zigbee_coordinator/#' -v
 | Discovery 不触发 | 在网络就绪时发布 Discovery |
 | 断电不显示 offline | 添加 LWT 遗嘱消息，设置 keepalive=10s |
 | retained 消息残留 | MQTT 连接成功时立即发布 online 状态 |
+| 长时间运行后离线 | 添加 WiFi/MQTT 无限自动重连 |
+| 状态不更新 | 添加 60 秒心跳定时器 |
+| 无法诊断问题原因 | 添加重启原因、运行时间、剩余内存属性 |
 
 ## 后续开发
 

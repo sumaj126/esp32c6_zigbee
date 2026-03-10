@@ -31,6 +31,8 @@
 #include "mqtt_client.h"
 #include "esp_zigbee_gateway.h"
 #include "zb_config_platform.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 
 static const char *TAG = "ESP_ZB_GATEWAY";
 
@@ -47,6 +49,10 @@ static bool ha_discovery_published = false;
 
 /* Forward declarations */
 static void mqtt_publish_coordinator_status(void);
+static void heartbeat_timer_cb(void *arg);
+
+/* Heartbeat interval in seconds */
+#define HEARTBEAT_INTERVAL_SEC  60
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
@@ -54,14 +60,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < WIFI_MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "Retry to connect to the AP");
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
-        ESP_LOGI(TAG, "Connect to the AP failed");
+        // Always reconnect WiFi (infinite retry)
+        mqtt_connected = false;  // Mark MQTT as disconnected
+        esp_wifi_connect();
+        s_retry_num++;
+        ESP_LOGW(TAG, "WiFi disconnected, retrying... (count: %d)", s_retry_num);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
@@ -141,7 +144,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         mqtt_publish_coordinator_status();
         break;
     case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "MQTT Disconnected from broker");
+        ESP_LOGW(TAG, "MQTT Disconnected from broker, will auto-reconnect");
         mqtt_connected = false;
         break;
     case MQTT_EVENT_SUBSCRIBED:
@@ -292,18 +295,54 @@ static void mqtt_publish_coordinator_status(void)
              ieee_address[3], ieee_address[2], ieee_address[1], ieee_address[0]);
     
     char topic[128];
-    char payload[512];
+    char payload[768];
     
     // State
     snprintf(topic, sizeof(topic), "homeassistant/sensor/zigbee_coordinator_%s/state", device_id);
     esp_mqtt_client_publish(mqtt_client, topic, "online", 0, 1, 1);
     
-    // Attributes
+    // Get reset reason
+    const char* reset_reason_str = "unknown";
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    switch (reset_reason) {
+        case ESP_RST_POWERON:       reset_reason_str = "power_on"; break;
+        case ESP_RST_EXT:           reset_reason_str = "external"; break;
+        case ESP_RST_SW:            reset_reason_str = "software"; break;
+        case ESP_RST_PANIC:         reset_reason_str = "panic"; break;
+        case ESP_RST_INT_WDT:       reset_reason_str = "int_wdt"; break;
+        case ESP_RST_TASK_WDT:      reset_reason_str = "task_wdt"; break;
+        case ESP_RST_WDT:           reset_reason_str = "wdt"; break;
+        case ESP_RST_DEEPSLEEP:     reset_reason_str = "deepsleep"; break;
+        case ESP_RST_BROWNOUT:      reset_reason_str = "brownout"; break;
+        case ESP_RST_SDIO:          reset_reason_str = "sdio"; break;
+        default:                    reset_reason_str = "other"; break;
+    }
+    
+    // Get uptime in seconds
+    int uptime_sec = (int)(esp_timer_get_time() / 1000000);
+    int uptime_hours = uptime_sec / 3600;
+    int uptime_mins = (uptime_sec % 3600) / 60;
+    int uptime_secs = uptime_sec % 60;
+    
+    // Attributes with diagnostics
     snprintf(topic, sizeof(topic), "homeassistant/sensor/zigbee_coordinator_%s/attributes", device_id);
     snprintf(payload, sizeof(payload),
-             "{\"pan_id\":\"0x%04hx\",\"channel\":%d,\"short_addr\":\"0x%04hx\",\"ieee\":\"%s\"}",
-             esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address(), device_id);
+             "{\"pan_id\":\"0x%04hx\",\"channel\":%d,\"short_addr\":\"0x%04hx\",\"ieee\":\"%s\",\"reset_reason\":\"%s\",\"uptime\":\"%02d:%02d:%02d\",\"free_heap\":%lu}",
+             esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address(), device_id,
+             reset_reason_str, uptime_hours, uptime_mins, uptime_secs,
+             (unsigned long)esp_get_free_heap_size());
     esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 1);
+}
+
+static void heartbeat_timer_cb(void *arg)
+{
+    // Publish status heartbeat
+    if (mqtt_connected) {
+        mqtt_publish_coordinator_status();
+        ESP_LOGD(TAG, "Heartbeat sent");
+    }
+    // Schedule next heartbeat
+    esp_zb_scheduler_alarm((esp_zb_callback_t)heartbeat_timer_cb, 0, HEARTBEAT_INTERVAL_SEC * 1000);
 }
 
 /* Note: Please select the correct console output port based on the development board in menuconfig */
@@ -409,6 +448,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                     mqtt_publish_ha_discovery();
                     mqtt_publish_coordinator_status();
                     ha_discovery_published = true;
+                    // Start heartbeat timer (every 60 seconds)
+                    esp_zb_scheduler_alarm((esp_zb_callback_t)heartbeat_timer_cb, 0, HEARTBEAT_INTERVAL_SEC * 1000);
+                    ESP_LOGI(TAG, "Heartbeat timer started (%d sec interval)", HEARTBEAT_INTERVAL_SEC);
                 }
             } else {
                 ESP_LOGW(TAG, "Network(0x%04hx) closed, devices joining not allowed.", esp_zb_get_pan_id());
