@@ -47,12 +47,25 @@ static esp_mqtt_client_handle_t mqtt_client = NULL;
 static bool mqtt_connected = false;
 static bool ha_discovery_published = false;
 
+/* ZigBee device tracking */
+static uint8_t zigbee_device_count = 0;
+
 /* Forward declarations */
 static void mqtt_publish_coordinator_status(void);
 static void heartbeat_timer_cb(void *arg);
 
 /* Heartbeat interval in seconds */
 #define HEARTBEAT_INTERVAL_SEC  60
+
+/* Get WiFi RSSI */
+static int8_t get_wifi_rssi(void)
+{
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        return ap_info.rssi;
+    }
+    return 0;  // Return 0 if unable to get RSSI
+}
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
@@ -323,14 +336,31 @@ static void mqtt_publish_coordinator_status(void)
     int uptime_hours = uptime_sec / 3600;
     int uptime_mins = (uptime_sec % 3600) / 60;
     int uptime_secs = uptime_sec % 60;
-    
+
+    // Get WiFi RSSI
+    int8_t wifi_rssi = get_wifi_rssi();
+
     // Attributes with diagnostics
     snprintf(topic, sizeof(topic), "homeassistant/sensor/zigbee_coordinator_%s/attributes", device_id);
-    snprintf(payload, sizeof(payload),
-             "{\"pan_id\":\"0x%04hx\",\"channel\":%d,\"short_addr\":\"0x%04hx\",\"ieee\":\"%s\",\"reset_reason\":\"%s\",\"uptime\":\"%02d:%02d:%02d\",\"free_heap\":%lu}",
-             esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address(), device_id,
-             reset_reason_str, uptime_hours, uptime_mins, uptime_secs,
-             (unsigned long)esp_get_free_heap_size());
+
+    // Build payload with WiFi RSSI and ZigBee device status
+    if (zigbee_device_count == 0) {
+        snprintf(payload, sizeof(payload),
+                 "{\"pan_id\":\"0x%04hx\",\"channel\":%d,\"short_addr\":\"0x%04hx\",\"ieee\":\"%s\","
+                 "\"reset_reason\":\"%s\",\"uptime\":\"%02d:%02d:%02d\",\"free_heap\":%lu,"
+                 "\"wifi_rssi\":%d,\"zigbee_devices\":\"N/A\"}",
+                 esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address(), device_id,
+                 reset_reason_str, uptime_hours, uptime_mins, uptime_secs,
+                 (unsigned long)esp_get_free_heap_size(), wifi_rssi);
+    } else {
+        snprintf(payload, sizeof(payload),
+                 "{\"pan_id\":\"0x%04hx\",\"channel\":%d,\"short_addr\":\"0x%04hx\",\"ieee\":\"%s\","
+                 "\"reset_reason\":\"%s\",\"uptime\":\"%02d:%02d:%02d\",\"free_heap\":%lu,"
+                 "\"wifi_rssi\":%d,\"zigbee_devices\":%d}",
+                 esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address(), device_id,
+                 reset_reason_str, uptime_hours, uptime_mins, uptime_secs,
+                 (unsigned long)esp_get_free_heap_size(), wifi_rssi, zigbee_device_count);
+    }
     esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 1);
 }
 
@@ -436,6 +466,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE:
         dev_annce_params = (esp_zb_zdo_signal_device_annce_params_t *)esp_zb_app_signal_get_params(p_sg_p);
         ESP_LOGI(TAG, "New device commissioned or rejoined (short: 0x%04hx)", dev_annce_params->device_short_addr);
+        // Increment device count
+        zigbee_device_count++;
+        ESP_LOGI(TAG, "Total ZigBee devices: %d", zigbee_device_count);
         // Publish device announcement to MQTT
         mqtt_publish_device_announce(dev_annce_params->device_short_addr, dev_annce_params->ieee_addr);
         break;
