@@ -33,6 +33,9 @@
 #include "zb_config_platform.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "zcl/esp_zigbee_zcl_common.h"
+#include "zcl/esp_zigbee_zcl_command.h"
+#include "zdo/esp_zigbee_zdo_command.h"
 
 static const char *TAG = "ESP_ZB_GATEWAY";
 
@@ -49,10 +52,36 @@ static bool ha_discovery_published = false;
 
 /* ZigBee device tracking */
 static uint8_t zigbee_device_count = 0;
+#define MAX_ZIGBEE_DEVICES 20
+
+/* Device info structure */
+typedef struct {
+    uint16_t short_addr;
+    esp_zb_ieee_addr_t ieee_addr;
+    uint8_t endpoint;
+    uint16_t device_id;
+    bool ha_discovery_done;
+    bool has_onoff;
+    bool has_level;
+    bool has_temperature;
+    bool has_humidity;
+    bool has_occupancy;  // 人体感应
+} zigbee_device_info_t;
+
+static zigbee_device_info_t zigbee_devices[MAX_ZIGBEE_DEVICES];
 
 /* Forward declarations */
 static void mqtt_publish_coordinator_status(void);
-static void heartbeat_timer_cb(void *arg);
+static void heartbeat_timer_cb(uint8_t param);
+static void handle_device_mqtt_command(char *ieee_str, char *data, int data_len);
+static void send_onoff_command(zigbee_device_info_t *device, bool onoff);
+static zigbee_device_info_t* find_device_by_ieee(const esp_zb_ieee_addr_t ieee_addr);
+static zigbee_device_info_t* find_device_by_short_addr(uint16_t short_addr);
+static void ieee_addr_to_string(esp_zb_ieee_addr_t ieee_addr, char *buf, size_t buf_len);
+static void query_device_simple_desc(uint16_t short_addr, uint8_t endpoint);
+static void simple_desc_resp_handler(esp_zb_zdp_status_t zdo_status, esp_zb_af_simple_desc_1_1_t *simple_desc, void *user_ctx);
+static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message);
+static void mqtt_publish_occupancy_event(zigbee_device_info_t *device, bool occupied);
 
 /* Heartbeat interval in seconds */
 #define HEARTBEAT_INTERVAL_SEC  60
@@ -65,6 +94,275 @@ static int8_t get_wifi_rssi(void)
         return ap_info.rssi;
     }
     return 0;  // Return 0 if unable to get RSSI
+}
+
+/* Get device IEEE address as string */
+static void ieee_addr_to_string(esp_zb_ieee_addr_t ieee_addr, char *buf, size_t buf_len)
+{
+    snprintf(buf, buf_len, "%02x%02x%02x%02x%02x%02x%02x%02x",
+             ieee_addr[7], ieee_addr[6], ieee_addr[5], ieee_addr[4],
+             ieee_addr[3], ieee_addr[2], ieee_addr[1], ieee_addr[0]);
+}
+
+/* User context for ZDO requests */
+typedef struct {
+    uint16_t short_addr;
+} zdo_user_ctx_t;
+
+static zdo_user_ctx_t zdo_ctx_pool[MAX_ZIGBEE_DEVICES];
+static int zdo_ctx_index = 0;
+
+/* ZDO Simple Descriptor callback */
+static void mqtt_publish_ha_discovery_for_sensor(zigbee_device_info_t *device)
+{
+    if (!mqtt_connected || mqtt_client == NULL || device == NULL) {
+        return;
+    }
+    
+    char ieee_str[20];
+    ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+    
+    char topic[128];
+    char payload[512];
+    
+    // Publish HA Discovery for occupancy sensor
+    snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/zigbee_%s/occupancy/config", ieee_str);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"人体感应传感器\",\"unique_id\":\"zigbee_%s_occupancy\",\"state_topic\":\"%s/%s/occupancy\",\"device_class\":\"occupancy\",\"device\":{\"identifiers\":[\"zigbee_%s\"],\"manufacturer\":\"Unknown\",\"model\":\"Occupancy Switch\"}}",
+             ieee_str, MQTT_TOPIC_PREFIX, ieee_str, ieee_str);
+    
+    esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 1);
+    ESP_LOGI(TAG, "Published HA Discovery for occupancy sensor device %s", ieee_str);
+}
+
+static void mqtt_publish_ha_discovery_for_switch(zigbee_device_info_t *device)
+{
+    if (!mqtt_connected || mqtt_client == NULL || device == NULL) {
+        return;
+    }
+    
+    char ieee_str[20];
+    ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+    
+    char topic[128];
+    char payload[512];
+    
+    // Publish HA Discovery for switch
+    snprintf(topic, sizeof(topic), "homeassistant/switch/zigbee_%s/switch/config", ieee_str);
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"人体感应开关\",\"unique_id\":\"zigbee_%s_switch\",\"command_topic\":\"%s/%s/set\",\"state_topic\":\"%s/%s\",\"value_template\":\"{{ value_json.state }}\",\"device\":{\"identifiers\":[\"zigbee_%s\"],\"name\":\"人体感应开关\",\"manufacturer\":\"Unknown\",\"model\":\"Occupancy Switch\"}}",
+             ieee_str, MQTT_TOPIC_PREFIX, ieee_str, MQTT_TOPIC_PREFIX, ieee_str, ieee_str);
+    
+    esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 1);
+    ESP_LOGI(TAG, "Published HA Discovery for switch device %s", ieee_str);
+}
+
+static void simple_desc_resp_handler(esp_zb_zdp_status_t zdo_status, esp_zb_af_simple_desc_1_1_t *simple_desc, void *user_ctx)
+{
+    zdo_user_ctx_t *ctx = (zdo_user_ctx_t *)user_ctx;
+    uint16_t short_addr = ctx->short_addr;
+    
+    if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS || simple_desc == NULL) {
+        ESP_LOGW(TAG, "Simple descriptor request failed for 0x%04x", short_addr);
+        return;
+    }
+
+    zigbee_device_info_t *device = find_device_by_short_addr(short_addr);
+    if (device == NULL) {
+        ESP_LOGW(TAG, "Device 0x%04x not found in list", short_addr);
+        return;
+    }
+
+    device->endpoint = simple_desc->endpoint;
+    device->device_id = simple_desc->app_device_id;
+    
+    ESP_LOGI(TAG, "Device 0x%04x ep:%d device_id:0x%04x", short_addr, simple_desc->endpoint, simple_desc->app_device_id);
+    ESP_LOGI(TAG, "  Input clusters: %d, Output clusters: %d", 
+             simple_desc->app_input_cluster_count, simple_desc->app_output_cluster_count);
+
+    /* Parse input clusters */
+    device->has_onoff = false;
+    device->has_level = false;
+    device->has_temperature = false;
+    device->has_humidity = false;
+    device->has_occupancy = false;
+
+    for (int i = 0; i < simple_desc->app_input_cluster_count; i++) {
+        uint16_t cluster = simple_desc->app_cluster_list[i];
+        ESP_LOGI(TAG, "  Input cluster[%d]: 0x%04x", i, cluster);
+        
+        switch (cluster) {
+            case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF:
+                device->has_onoff = true;
+                break;
+            case ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL:
+                device->has_level = true;
+                break;
+            case ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT:
+                device->has_temperature = true;
+                break;
+            case ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT:
+                device->has_humidity = true;
+                break;
+            case ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE:
+            case ESP_ZB_ZCL_CLUSTER_ID_OCCUPANCY_SENSING:
+                device->has_occupancy = true;
+                ESP_LOGI(TAG, "  Device has occupancy sensing capability");
+                break;
+        }
+    }
+    
+    // Publish HA Discovery for sensor if it has occupancy capability
+    if (device->has_occupancy) {
+        mqtt_publish_ha_discovery_for_sensor(device);
+    }
+    // Also publish HA Discovery for switch if it has on/off capability
+    if (device->has_onoff) {
+        mqtt_publish_ha_discovery_for_switch(device);
+        char ieee_str[20];
+        ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+        char topic[64];
+        snprintf(topic, sizeof(topic), "%s/%s/set", MQTT_TOPIC_PREFIX, ieee_str);
+        esp_mqtt_client_subscribe(mqtt_client, topic, 0);
+        ESP_LOGI(TAG, "Subscribed to %s", topic);
+    }
+    // Mark discovery as done regardless of capabilities
+    device->ha_discovery_done = true;
+}
+
+/* Query device simple descriptor */
+static void query_device_simple_desc(uint16_t short_addr, uint8_t endpoint)
+{
+    static esp_zb_zdo_simple_desc_req_param_t req;
+    req.addr_of_interest = short_addr;
+    req.endpoint = endpoint;
+    
+    zdo_user_ctx_t *ctx = &zdo_ctx_pool[zdo_ctx_index % MAX_ZIGBEE_DEVICES];
+    zdo_ctx_index++;
+    ctx->short_addr = short_addr;
+    
+    esp_zb_zdo_simple_desc_req(&req, simple_desc_resp_handler, ctx);
+}
+
+/* Find device by short address */
+static zigbee_device_info_t* find_device_by_short_addr(uint16_t short_addr)
+{
+    for (int i = 0; i < zigbee_device_count; i++) {
+        if (zigbee_devices[i].short_addr == short_addr) {
+            return &zigbee_devices[i];
+        }
+    }
+    return NULL;
+}
+
+/* Find device by IEEE address */
+static zigbee_device_info_t* find_device_by_ieee(const esp_zb_ieee_addr_t ieee_addr)
+{
+    for (int i = 0; i < zigbee_device_count; i++) {
+        if (memcmp(zigbee_devices[i].ieee_addr, ieee_addr, sizeof(esp_zb_ieee_addr_t)) == 0) {
+            return &zigbee_devices[i];
+        }
+    }
+    return NULL;
+}
+
+/* Send On/Off command to device */
+static void send_onoff_command(zigbee_device_info_t *device, bool onoff)
+{
+    if (device == NULL) {
+        return;
+    }
+
+    esp_zb_zcl_on_off_cmd_t cmd;
+    cmd.zcl_basic_cmd.dst_addr_u.addr_short = device->short_addr;
+    cmd.zcl_basic_cmd.dst_endpoint = device->endpoint;
+    cmd.zcl_basic_cmd.src_endpoint = ESP_ZB_GATEWAY_ENDPOINT;
+    cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+    cmd.on_off_cmd_id = onoff ? ESP_ZB_ZCL_CMD_ON_OFF_ON_ID : ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID;
+
+    esp_zb_zcl_on_off_cmd_req(&cmd);
+    ESP_LOGI(TAG, "Sent %s command to device 0x%04x", onoff ? "ON" : "OFF", device->short_addr);
+    
+    // Publish switch state to MQTT
+    if (mqtt_connected && mqtt_client != NULL) {
+        char ieee_str[20];
+        ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+        char topic[64];
+        char payload[64];
+        snprintf(topic, sizeof(topic), "%s/%s", MQTT_TOPIC_PREFIX, ieee_str);
+        snprintf(payload, sizeof(payload), "{\"state\":\"%s\"}", onoff ? "ON" : "OFF");
+        int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+        ESP_LOGI(TAG, "Published switch state to MQTT: %s, msg_id=%d", onoff ? "ON" : "OFF", msg_id);
+    }
+}
+
+/* Handle MQTT command for device */
+static void handle_device_mqtt_command(char *ieee_str, char *data, int data_len)
+{
+    /* Find device by IEEE address */
+    if (strlen(ieee_str) != 16) {
+        ESP_LOGW(TAG, "Invalid IEEE address format: %s", ieee_str);
+        return;
+    }
+    
+    /* Parse IEEE address */
+    // Try different byte orders to find the device
+    esp_zb_ieee_addr_t ieee_addr1, ieee_addr2;
+    
+    // Order 1: direct order (as received)
+    for (int i = 0; i < 8; i++) {
+        char byte_str[3] = {ieee_str[i*2], ieee_str[i*2+1], 0};
+        ieee_addr1[i] = (uint8_t)strtol(byte_str, NULL, 16);
+    }
+    
+    // Order 2: reverse order (swap endian)
+    for (int i = 0; i < 8; i++) {
+        char byte_str[3] = {ieee_str[i*2], ieee_str[i*2+1], 0};
+        ieee_addr2[7-i] = (uint8_t)strtol(byte_str, NULL, 16);
+    }
+    
+    // Try to find device with both orders
+    zigbee_device_info_t *device = find_device_by_ieee(ieee_addr1);
+    if (device == NULL) {
+        device = find_device_by_ieee(ieee_addr2);
+    }
+    
+    // If still not found, try to find by short address (if available)
+    if (device == NULL) {
+        // Try to extract short address from IEEE address (last 2 bytes)
+        uint16_t short_addr = 0;
+        char short_addr_str[5] = {0};
+        strncpy(short_addr_str, ieee_str + 12, 4);
+        short_addr = (uint16_t)strtol(short_addr_str, NULL, 16);
+        device = find_device_by_short_addr(short_addr);
+        if (device != NULL) {
+            ESP_LOGI(TAG, "Found device by short address: 0x%04x", short_addr);
+        }
+    }
+    if (device == NULL) {
+        ESP_LOGW(TAG, "Device not found: %s", ieee_str);
+        // Log all devices for debugging
+        ESP_LOGW(TAG, "Current devices in list:");
+        for (int i = 0; i < zigbee_device_count; i++) {
+            char device_ieee_str[20];
+            ieee_addr_to_string(zigbee_devices[i].ieee_addr, device_ieee_str, sizeof(device_ieee_str));
+            ESP_LOGW(TAG, "  Device %d: short=0x%04x, ieee=%s, endpoint=%d", 
+                     i, zigbee_devices[i].short_addr, device_ieee_str, zigbee_devices[i].endpoint);
+        }
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Found device: short=0x%04x, ieee=%s, endpoint=%d", 
+             device->short_addr, ieee_str, device->endpoint);
+
+    /* Parse command */
+    if (strcasecmp(data, "ON") == 0 || strstr(data, "ON")) {
+        send_onoff_command(device, true);
+    } else if (strcasecmp(data, "OFF") == 0 || strstr(data, "OFF")) {
+        send_onoff_command(device, false);
+    } else {
+        ESP_LOGW(TAG, "Unknown command: %s", data);
+    }
 }
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -151,8 +449,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT Connected to broker");
         mqtt_connected = true;
-        // Subscribe to command topic
+        // Subscribe to bridge topics
         esp_mqtt_client_subscribe(event->client, MQTT_TOPIC_PREFIX "/bridge/#", 0);
+        // Subscribe to device command topics
+        esp_mqtt_client_subscribe(event->client, MQTT_TOPIC_PREFIX "/+/set", 0);
         // Publish online status immediately to clear any retained offline
         mqtt_publish_coordinator_status();
         break;
@@ -161,12 +461,29 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         mqtt_connected = false;
         break;
     case MQTT_EVENT_SUBSCRIBED:
-        ESP_LOGD(TAG, "MQTT Subscribed, msg_id=%d", event->msg_id);
+        ESP_LOGI(TAG, "MQTT Subscribed, msg_id=%d", event->msg_id);
         break;
     case MQTT_EVENT_DATA:
-        ESP_LOGI(TAG, "MQTT Data received: topic=%.*s, data=%.*s", 
-                 event->topic_len, event->topic, event->data_len, event->data);
-        // TODO: Handle incoming commands for Zigbee devices
+        // Parse topic to check if it's a device command
+        char topic[128];
+        int topic_len = event->topic_len < sizeof(topic) - 1 ? event->topic_len : sizeof(topic) - 1;
+        strncpy(topic, event->topic, topic_len);
+        topic[topic_len] = '\0';
+        
+        // Check if it's a device set command: zigbee2mqtt/<ieee>/set
+        if (strncmp(topic, MQTT_TOPIC_PREFIX "/", strlen(MQTT_TOPIC_PREFIX) + 1) == 0) {
+            char *ieee_start = topic + strlen(MQTT_TOPIC_PREFIX) + 1;
+            char *set_pos = strstr(ieee_start, "/set");
+            if (set_pos != NULL) {
+                *set_pos = '\0';  // Terminate IEEE address
+                char *data = strndup(event->data, event->data_len);
+                if (data != NULL) {
+                    ESP_LOGI(TAG, "MQTT Data: topic=%s, data=%s", topic, data);
+                    handle_device_mqtt_command(ieee_start, data, event->data_len);
+                    free(data);
+                }
+            }
+        }
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG, "MQTT Error");
@@ -220,15 +537,16 @@ static void mqtt_publish_device_announce(uint16_t short_addr, esp_zb_ieee_addr_t
         return;
     }
     
+    char ieee_str[20];
+    ieee_addr_to_string(ieee_addr, ieee_str, sizeof(ieee_str));
+    
     char topic[64];
     char payload[256];
     
-    snprintf(topic, sizeof(topic), "%s/%04x", MQTT_TOPIC_PREFIX, short_addr);
+    snprintf(topic, sizeof(topic), "%s/bridge/device/%s", MQTT_TOPIC_PREFIX, ieee_str);
     snprintf(payload, sizeof(payload), 
-             "{\"ieeeAddr\":\"%02x%02x%02x%02x%02x%02x%02x%02x\",\"type\":\"Unknown\",\"networkAddress\":%d}",
-             ieee_addr[7], ieee_addr[6], ieee_addr[5], ieee_addr[4],
-             ieee_addr[3], ieee_addr[2], ieee_addr[1], ieee_addr[0],
-             short_addr);
+             "{\"ieeeAddr\":\"%s\",\"type\":\"Unknown\",\"networkAddress\":%d}",
+             ieee_str, short_addr);
     
     int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
     ESP_LOGI(TAG, "Published device announce to MQTT, msg_id=%d", msg_id);
@@ -291,6 +609,28 @@ static void mqtt_publish_ha_discovery(void)
     esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 1);
     
     ESP_LOGI(TAG, "Published HA Discovery for coordinator");
+}
+
+static void publish_device_states(void)
+{
+    if (!mqtt_connected || mqtt_client == NULL) {
+        return;
+    }
+    
+    // Publish state for all devices
+    for (int i = 0; i < zigbee_device_count; i++) {
+        zigbee_device_info_t *device = &zigbee_devices[i];
+        char ieee_str[20];
+        ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+        
+        // Publish switch state (default to OFF if unknown)
+        char topic[64];
+        char payload[64];
+        snprintf(topic, sizeof(topic), "%s/%s", MQTT_TOPIC_PREFIX, ieee_str);
+        snprintf(payload, sizeof(payload), "{\"state\":\"OFF\",\"occupancy\":false}");
+        esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+        ESP_LOGI(TAG, "Published initial state for device %s: OFF", ieee_str);
+    }
 }
 
 static void mqtt_publish_coordinator_status(void)
@@ -362,9 +702,217 @@ static void mqtt_publish_coordinator_status(void)
                  (unsigned long)esp_get_free_heap_size(), wifi_rssi, zigbee_device_count);
     }
     esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 1);
+    
+    // Publish initial states for all devices
+    publish_device_states();
 }
 
-static void heartbeat_timer_cb(void *arg)
+static void mqtt_publish_occupancy_event(zigbee_device_info_t *device, bool occupied)
+{
+    if (!mqtt_connected || mqtt_client == NULL || device == NULL) {
+        return;
+    }
+    
+    char ieee_str[20];
+    ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+    
+    char topic[64];
+    char payload[64];
+    
+    // Publish to the device's main topic
+    snprintf(topic, sizeof(topic), "%s/%s", MQTT_TOPIC_PREFIX, ieee_str);
+    snprintf(payload, sizeof(payload), "{\"occupancy\":%s,\"state\":\"%s\"}", 
+             occupied ? "true" : "false", 
+             occupied ? "ON" : "OFF");
+    
+    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+    ESP_LOGI(TAG, "Published occupancy event to MQTT: %s, msg_id=%d", occupied ? "occupied" : "not occupied", msg_id);
+    
+    // Also publish to a dedicated occupancy topic for sensor
+    snprintf(topic, sizeof(topic), "%s/%s/occupancy", MQTT_TOPIC_PREFIX, ieee_str);
+    snprintf(payload, sizeof(payload), "%s", occupied ? "ON" : "OFF");
+    esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+}
+
+static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message)
+{
+    switch (callback_id) {
+        case ESP_ZB_CORE_CMD_IAS_ZONE_ZONE_STATUS_CHANGE_NOT_ID: {
+            // Handle IAS Zone status change notification (human presence detection)
+            const esp_zb_zcl_ias_zone_status_change_notification_message_t *zone_msg = (
+                const esp_zb_zcl_ias_zone_status_change_notification_message_t *)message;
+            
+            ESP_LOGI(TAG, "IAS Zone status change notification received");
+            ESP_LOGI(TAG, "  Source endpoint: %d", zone_msg->info.src_endpoint);
+            ESP_LOGI(TAG, "  Zone status: 0x%04x", zone_msg->zone_status);
+            ESP_LOGI(TAG, "  Zone ID: %d", zone_msg->zone_id);
+            
+            // Check if zone status indicates occupancy
+            bool occupied = (zone_msg->zone_status & 0x0001) != 0; // Bit 0: Alarm1
+            ESP_LOGI(TAG, "  Occupancy status: %s", occupied ? "occupied" : "not occupied");
+            
+            // Get source address based on address type
+            uint16_t src_short_addr = 0;
+            if (zone_msg->info.src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT) {
+                src_short_addr = zone_msg->info.src_address.u.short_addr;
+                ESP_LOGI(TAG, "  Source address (short): 0x%04x", src_short_addr);
+            } else if (zone_msg->info.src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_IEEE) {
+                ESP_LOGI(TAG, "  Source address (IEEE): %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+                         zone_msg->info.src_address.u.ieee_addr[0], zone_msg->info.src_address.u.ieee_addr[1],
+                         zone_msg->info.src_address.u.ieee_addr[2], zone_msg->info.src_address.u.ieee_addr[3],
+                         zone_msg->info.src_address.u.ieee_addr[4], zone_msg->info.src_address.u.ieee_addr[5],
+                         zone_msg->info.src_address.u.ieee_addr[6], zone_msg->info.src_address.u.ieee_addr[7]);
+                // Try to find device by IEEE address
+                zigbee_device_info_t *device = find_device_by_ieee(zone_msg->info.src_address.u.ieee_addr);
+                if (device != NULL) {
+                    ESP_LOGI(TAG, "  Device found by IEEE address: short=0x%04x", device->short_addr);
+                    // Publish occupancy event to MQTT
+                    mqtt_publish_occupancy_event(device, occupied);
+                } else {
+                    ESP_LOGW(TAG, "  Device not found by IEEE address");
+                    // Log all devices for debugging
+                    ESP_LOGW(TAG, "  Current devices in list:");
+                    for (int i = 0; i < zigbee_device_count; i++) {
+                        char device_ieee_str[20];
+                        ieee_addr_to_string(zigbee_devices[i].ieee_addr, device_ieee_str, sizeof(device_ieee_str));
+                        ESP_LOGW(TAG, "    Device %d: short=0x%04x, ieee=%s", 
+                                 i, zigbee_devices[i].short_addr, device_ieee_str);
+                    }
+                }
+                break;
+            }
+            
+            // Find device by short address
+            zigbee_device_info_t *device = find_device_by_short_addr(src_short_addr);
+            if (device != NULL) {
+                ESP_LOGI(TAG, "  Device found: short=0x%04x, ieee=", device->short_addr);
+                char ieee_str[20];
+                ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+                ESP_LOGI(TAG, "  IEEE: %s", ieee_str);
+                
+                // Publish occupancy event to MQTT
+                mqtt_publish_occupancy_event(device, occupied);
+            } else {
+                ESP_LOGW(TAG, "  Device not found for short address: 0x%04x", src_short_addr);
+                // Try to find device by IEEE address if available
+                if (zone_msg->info.src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_IEEE) {
+                    device = find_device_by_ieee(zone_msg->info.src_address.u.ieee_addr);
+                    if (device != NULL) {
+                        ESP_LOGI(TAG, "  Device found by IEEE address: short=0x%04x", device->short_addr);
+                        // Update short address
+                        device->short_addr = src_short_addr;
+                        ESP_LOGI(TAG, "  Updated device short address to: 0x%04x", src_short_addr);
+                        // Publish occupancy event to MQTT
+                        mqtt_publish_occupancy_event(device, occupied);
+                    } else {
+                        // Log all devices for debugging
+                        ESP_LOGW(TAG, "  Current devices in list:");
+                        for (int i = 0; i < zigbee_device_count; i++) {
+                            char device_ieee_str[20];
+                            ieee_addr_to_string(zigbee_devices[i].ieee_addr, device_ieee_str, sizeof(device_ieee_str));
+                            ESP_LOGW(TAG, "    Device %d: short=0x%04x, ieee=%s", 
+                                     i, zigbee_devices[i].short_addr, device_ieee_str);
+                        }
+                    }
+                } else {
+                    // Log all devices for debugging
+                    ESP_LOGW(TAG, "  Current devices in list:");
+                    for (int i = 0; i < zigbee_device_count; i++) {
+                        char device_ieee_str[20];
+                        ieee_addr_to_string(zigbee_devices[i].ieee_addr, device_ieee_str, sizeof(device_ieee_str));
+                        ESP_LOGW(TAG, "    Device %d: short=0x%04x, ieee=%s", 
+                                 i, zigbee_devices[i].short_addr, device_ieee_str);
+                    }
+                }
+            }
+            break;
+        }
+        case ESP_ZB_CORE_CMD_IAS_ZONE_ZONE_ENROLL_REQUEST_ID: {
+            // Handle IAS Zone enroll request
+            const esp_zb_zcl_ias_zone_enroll_request_message_t *enroll_msg = (
+                const esp_zb_zcl_ias_zone_enroll_request_message_t *)message;
+            
+            ESP_LOGI(TAG, "IAS Zone enroll request received");
+            ESP_LOGI(TAG, "  Source endpoint: %d", enroll_msg->info.src_endpoint);
+            ESP_LOGI(TAG, "  Zone type: 0x%04x", enroll_msg->zone_type);
+            
+            // Get source address based on address type
+            uint16_t src_short_addr = 0;
+            if (enroll_msg->info.src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT) {
+                src_short_addr = enroll_msg->info.src_address.u.short_addr;
+                ESP_LOGI(TAG, "  Source address (short): 0x%04x", src_short_addr);
+            } else if (enroll_msg->info.src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_IEEE) {
+                ESP_LOGI(TAG, "  Source address (IEEE): %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+                         enroll_msg->info.src_address.u.ieee_addr[0], enroll_msg->info.src_address.u.ieee_addr[1],
+                         enroll_msg->info.src_address.u.ieee_addr[2], enroll_msg->info.src_address.u.ieee_addr[3],
+                         enroll_msg->info.src_address.u.ieee_addr[4], enroll_msg->info.src_address.u.ieee_addr[5],
+                         enroll_msg->info.src_address.u.ieee_addr[6], enroll_msg->info.src_address.u.ieee_addr[7]);
+                // Try to find device by IEEE address
+                zigbee_device_info_t *device = find_device_by_ieee(enroll_msg->info.src_address.u.ieee_addr);
+                if (device != NULL) {
+                    src_short_addr = device->short_addr;
+                    ESP_LOGI(TAG, "  Device found by IEEE address: short=0x%04x", src_short_addr);
+                }
+            }
+            
+            // Send enroll response
+            esp_zb_zcl_ias_zone_enroll_response_cmd_t enroll_rsp;
+            enroll_rsp.zcl_basic_cmd.dst_addr_u.addr_short = src_short_addr;
+            enroll_rsp.zcl_basic_cmd.dst_endpoint = enroll_msg->info.src_endpoint;
+            enroll_rsp.zcl_basic_cmd.src_endpoint = ESP_ZB_GATEWAY_ENDPOINT;
+            enroll_rsp.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+            enroll_rsp.enroll_rsp_code = 0x00; // Success
+            enroll_rsp.zone_id = 1; // Assign zone ID
+            
+            esp_zb_zcl_ias_zone_enroll_cmd_resp(&enroll_rsp);
+            ESP_LOGI(TAG, "Sent IAS Zone enroll response with zone ID: %d", enroll_rsp.zone_id);
+            break;
+        }
+        case ESP_ZB_CORE_REPORT_ATTR_CB_ID: {
+            // Handle attribute report (for Occupancy Sensing cluster)
+            const esp_zb_zcl_report_attr_message_t *report_msg = (
+                const esp_zb_zcl_report_attr_message_t *)message;
+            
+            // Check if it's an Occupancy Sensing cluster report
+            if (report_msg->cluster == ESP_ZB_ZCL_CLUSTER_ID_OCCUPANCY_SENSING) {
+                ESP_LOGI(TAG, "Occupancy Sensing attribute report received");
+                ESP_LOGI(TAG, "  Source endpoint: %d", report_msg->src_endpoint);
+                ESP_LOGI(TAG, "  Cluster: 0x%04x", report_msg->cluster);
+                ESP_LOGI(TAG, "  Attribute ID: 0x%04x", report_msg->attribute.id);
+                
+                // Check if it's the Occupancy attribute
+                if (report_msg->attribute.id == ESP_ZB_ZCL_ATTR_OCCUPANCY_SENSING_OCCUPANCY_ID) {
+                    // Get occupancy value
+                    bool occupied = false;
+                    if (report_msg->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL) {
+                        occupied = *(bool *)report_msg->attribute.data.value;
+                    } else if (report_msg->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U8) {
+                        occupied = *(uint8_t *)report_msg->attribute.data.value;
+                    }
+                    
+                    ESP_LOGI(TAG, "  Occupancy: %s", occupied ? "occupied" : "not occupied");
+                    
+                    // Find device by IEEE address
+                    zigbee_device_info_t *device = find_device_by_ieee(report_msg->src_address.u.ieee_addr);
+                    if (device != NULL) {
+                        ESP_LOGI(TAG, "  Device found: short=0x%04x", device->short_addr);
+                        // Publish occupancy event to MQTT
+                        mqtt_publish_occupancy_event(device, occupied);
+                    } else {
+                        ESP_LOGW(TAG, "  Device not found by IEEE address");
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            // Ignore other events
+            break;
+    }
+    return ESP_OK;
+}
+
+static void heartbeat_timer_cb(uint8_t param)
 {
     // Publish status heartbeat
     if (mqtt_connected) {
@@ -372,7 +920,7 @@ static void heartbeat_timer_cb(void *arg)
         ESP_LOGD(TAG, "Heartbeat sent");
     }
     // Schedule next heartbeat
-    esp_zb_scheduler_alarm((esp_zb_callback_t)heartbeat_timer_cb, 0, HEARTBEAT_INTERVAL_SEC * 1000);
+    esp_zb_scheduler_alarm(heartbeat_timer_cb, 0, HEARTBEAT_INTERVAL_SEC * 1000);
 }
 
 /* Note: Please select the correct console output port based on the development board in menuconfig */
@@ -464,13 +1012,47 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         }
         break;
     case ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE:
+    case ESP_ZB_ZDO_SIGNAL_DEVICE_UPDATE:
         dev_annce_params = (esp_zb_zdo_signal_device_annce_params_t *)esp_zb_app_signal_get_params(p_sg_p);
-        ESP_LOGI(TAG, "New device commissioned or rejoined (short: 0x%04hx)", dev_annce_params->device_short_addr);
-        // Increment device count
-        zigbee_device_count++;
-        ESP_LOGI(TAG, "Total ZigBee devices: %d", zigbee_device_count);
-        // Publish device announcement to MQTT
-        mqtt_publish_device_announce(dev_annce_params->device_short_addr, dev_annce_params->ieee_addr);
+        if (dev_annce_params != NULL) {
+            ESP_LOGI(TAG, "New device commissioned or rejoined (short: 0x%04hx)", dev_annce_params->device_short_addr);
+            
+            // Check if device already exists
+            zigbee_device_info_t *existing = find_device_by_ieee(dev_annce_params->ieee_addr);
+            if (existing != NULL) {
+                ESP_LOGI(TAG, "Device already known, updating short address");
+                existing->short_addr = dev_annce_params->device_short_addr;
+            } else if (zigbee_device_count < MAX_ZIGBEE_DEVICES) {
+                // Add new device
+                zigbee_device_info_t *new_device = &zigbee_devices[zigbee_device_count];
+                new_device->short_addr = dev_annce_params->device_short_addr;
+                memcpy(new_device->ieee_addr, dev_annce_params->ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                new_device->endpoint = 1;  // Default to endpoint 1
+                new_device->device_id = 0;
+                new_device->ha_discovery_done = false;
+                new_device->has_onoff = true;  // Assume device has on/off capability
+                new_device->has_level = false;
+                new_device->has_temperature = false;
+                new_device->has_humidity = false;
+                new_device->has_occupancy = true;  // 假设设备具有人体感应功能
+                zigbee_device_count++;
+                
+                ESP_LOGI(TAG, "Total ZigBee devices: %d", zigbee_device_count);
+                mqtt_publish_device_announce(dev_annce_params->device_short_addr, dev_annce_params->ieee_addr);
+                
+                // Publish initial state for the new device
+                publish_device_states();
+                
+                // Query device simple descriptor to detect capabilities
+                // Only query endpoint 1 (most devices have only one endpoint)
+                ESP_LOGI(TAG, "Querying simple descriptor for device 0x%04x endpoint 1", dev_annce_params->device_short_addr);
+                query_device_simple_desc(dev_annce_params->device_short_addr, 1);
+            } else {
+                ESP_LOGW(TAG, "Max devices reached, cannot add more");
+            }
+        } else {
+            ESP_LOGW(TAG, "Device announce parameters are NULL");
+        }
         break;
     case ESP_ZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
         if (err_status == ESP_OK) {
@@ -482,7 +1064,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                     mqtt_publish_coordinator_status();
                     ha_discovery_published = true;
                     // Start heartbeat timer (every 60 seconds)
-                    esp_zb_scheduler_alarm((esp_zb_callback_t)heartbeat_timer_cb, 0, HEARTBEAT_INTERVAL_SEC * 1000);
+                    esp_zb_scheduler_alarm(heartbeat_timer_cb, 0, HEARTBEAT_INTERVAL_SEC * 1000);
                     ESP_LOGI(TAG, "Heartbeat timer started (%d sec interval)", HEARTBEAT_INTERVAL_SEC);
                 }
             } else {
@@ -506,6 +1088,10 @@ static void esp_zb_task(void *pvParameters)
     /* initialize Zigbee stack */
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZC_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
+    
+    // Register Zigbee core action handler for IAS Zone events
+    esp_zb_core_action_handler_register(zb_core_action_handler);
+    
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
     esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
@@ -530,6 +1116,9 @@ static void esp_zb_task(void *pvParameters)
 
 void app_main(void)
 {
+    // Set log level for custom cluster module to reduce error messages
+    esp_log_level_set("ESP_ZIGBEE_ZCL_CUSTOM_CLUSTER", ESP_LOG_WARN);
+    
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
