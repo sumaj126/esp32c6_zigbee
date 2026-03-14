@@ -623,13 +623,13 @@ static void publish_device_states(void)
         char ieee_str[20];
         ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
         
-        // Publish switch state (default to OFF if unknown)
+        // Publish initial state without forcing OFF, wait for actual state report
         char topic[64];
         char payload[64];
         snprintf(topic, sizeof(topic), "%s/%s", MQTT_TOPIC_PREFIX, ieee_str);
-        snprintf(payload, sizeof(payload), "{\"state\":\"OFF\",\"occupancy\":false}");
+        snprintf(payload, sizeof(payload), "{\"occupancy\":false}");
         esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
-        ESP_LOGI(TAG, "Published initial state for device %s: OFF", ieee_str);
+        ESP_LOGI(TAG, "Published initial state for device %s (waiting for actual state report)", ieee_str);
     }
 }
 
@@ -923,6 +923,25 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                     
                     // Find device by IEEE address
                     zigbee_device_info_t *device = find_device_by_ieee(report_msg->src_address.u.ieee_addr);
+                    
+                    // If not found, try reverse byte order
+                    if (device == NULL) {
+                        esp_zb_ieee_addr_t reversed_addr;
+                        for (int i = 0; i < 8; i++) {
+                            reversed_addr[i] = report_msg->src_address.u.ieee_addr[7 - i];
+                        }
+                        device = find_device_by_ieee(reversed_addr);
+                    }
+                    
+                    // If still not found, try to find by short address from the message
+                    if (device == NULL && report_msg->src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT) {
+                        uint16_t short_addr = report_msg->src_address.u.short_addr;
+                        device = find_device_by_short_addr(short_addr);
+                        if (device != NULL) {
+                            ESP_LOGI(TAG, "  Device found by short address: 0x%04x", short_addr);
+                        }
+                    }
+                    
                     if (device != NULL) {
                         ESP_LOGI(TAG, "  Device found: short=0x%04x", device->short_addr);
                         // Publish on/off state to MQTT
@@ -938,6 +957,16 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                         }
                     } else {
                         ESP_LOGW(TAG, "  Device not found by IEEE address");
+                        // Log IEEE address for debugging
+                        ESP_LOGW(TAG, "  IEEE address: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+                                 report_msg->src_address.u.ieee_addr[0], report_msg->src_address.u.ieee_addr[1],
+                                 report_msg->src_address.u.ieee_addr[2], report_msg->src_address.u.ieee_addr[3],
+                                 report_msg->src_address.u.ieee_addr[4], report_msg->src_address.u.ieee_addr[5],
+                                 report_msg->src_address.u.ieee_addr[6], report_msg->src_address.u.ieee_addr[7]);
+                        // Log short address if available
+                        if (report_msg->src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT) {
+                            ESP_LOGW(TAG, "  Short address: 0x%04x", report_msg->src_address.u.short_addr);
+                        }
                     }
                 }
             }
@@ -1078,13 +1107,13 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 ESP_LOGI(TAG, "Total ZigBee devices: %d", zigbee_device_count);
                 mqtt_publish_device_announce(dev_annce_params->device_short_addr, dev_annce_params->ieee_addr);
                 
-                // Publish initial state for the new device
-                publish_device_states();
-                
                 // Query device simple descriptor to detect capabilities
                 // Only query endpoint 1 (most devices have only one endpoint)
                 ESP_LOGI(TAG, "Querying simple descriptor for device 0x%04x endpoint 1", dev_annce_params->device_short_addr);
                 query_device_simple_desc(dev_annce_params->device_short_addr, 1);
+                
+                // Publish initial state for the new device (but don't force OFF, wait for actual state report)
+                // We'll let the device report its actual state via attribute report
             } else {
                 ESP_LOGW(TAG, "Max devices reached, cannot add more");
             }
