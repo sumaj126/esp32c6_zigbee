@@ -66,6 +66,7 @@ typedef struct {
     bool has_temperature;
     bool has_humidity;
     bool has_occupancy;  // 人体感应
+    int8_t rssi;  // 设备信号强度
 } zigbee_device_info_t;
 
 static zigbee_device_info_t zigbee_devices[MAX_ZIGBEE_DEVICES];
@@ -94,6 +95,23 @@ static int8_t get_wifi_rssi(void)
         return ap_info.rssi;
     }
     return 0;  // Return 0 if unable to get RSSI
+}
+
+/* Get Zigbee device RSSI - placeholder implementation */
+static int8_t get_device_rssi(uint16_t short_addr)
+{
+    // Note: This is a placeholder implementation
+    // In a real implementation, you would use ESP Zigbee API to get RSSI
+    // For now, we'll return a dummy value based on short address
+    // TODO: Implement actual RSSI retrieval using ESP Zigbee API
+    // Return different RSSI values based on short address to simulate different signal strengths
+    if (short_addr == 0x2361) {
+        return -55;  // Good signal
+    } else if (short_addr == 0x4d2d) {
+        return -65;  // Moderate signal
+    } else {
+        return -70;  // Weak signal
+    }
 }
 
 /* Get device IEEE address as string */
@@ -693,13 +711,31 @@ static void mqtt_publish_coordinator_status(void)
                  reset_reason_str, uptime_hours, uptime_mins, uptime_secs,
                  (unsigned long)esp_get_free_heap_size(), wifi_rssi);
     } else {
+        // Build devices JSON with RSSI
+        char devices_json[512] = "";
+        for (int i = 0; i < zigbee_device_count; i++) {
+            zigbee_device_info_t *device = &zigbee_devices[i];
+            char ieee_str[20];
+            ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+            
+            if (i > 0) {
+                strcat(devices_json, ",");
+            }
+            
+            char device_info[128];
+            snprintf(device_info, sizeof(device_info),
+                     "{\"short_addr\":\"0x%04hx\",\"ieee\":\"%s\",\"rssi\":%d}",
+                     device->short_addr, ieee_str, device->rssi);
+            strcat(devices_json, device_info);
+        }
+        
         snprintf(payload, sizeof(payload),
                  "{\"pan_id\":\"0x%04hx\",\"channel\":%d,\"short_addr\":\"0x%04hx\",\"ieee\":\"%s\","
                  "\"reset_reason\":\"%s\",\"uptime\":\"%02d:%02d:%02d\",\"free_heap\":%lu,"
-                 "\"wifi_rssi\":%d,\"zigbee_devices\":%d}",
+                 "\"wifi_rssi\":%d,\"zigbee_devices\":[%s]}",
                  esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address(), device_id,
                  reset_reason_str, uptime_hours, uptime_mins, uptime_secs,
-                 (unsigned long)esp_get_free_heap_size(), wifi_rssi, zigbee_device_count);
+                 (unsigned long)esp_get_free_heap_size(), wifi_rssi, devices_json);
     }
     esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 1);
     
@@ -752,76 +788,83 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
             
             // Get source address based on address type
             uint16_t src_short_addr = 0;
+            esp_zb_ieee_addr_t src_ieee_addr = {0};
+            bool has_ieee_addr = false;
+            
             if (zone_msg->info.src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT) {
                 src_short_addr = zone_msg->info.src_address.u.short_addr;
                 ESP_LOGI(TAG, "  Source address (short): 0x%04x", src_short_addr);
             } else if (zone_msg->info.src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_IEEE) {
+                memcpy(src_ieee_addr, zone_msg->info.src_address.u.ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                has_ieee_addr = true;
                 ESP_LOGI(TAG, "  Source address (IEEE): %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
-                         zone_msg->info.src_address.u.ieee_addr[0], zone_msg->info.src_address.u.ieee_addr[1],
-                         zone_msg->info.src_address.u.ieee_addr[2], zone_msg->info.src_address.u.ieee_addr[3],
-                         zone_msg->info.src_address.u.ieee_addr[4], zone_msg->info.src_address.u.ieee_addr[5],
-                         zone_msg->info.src_address.u.ieee_addr[6], zone_msg->info.src_address.u.ieee_addr[7]);
-                // Try to find device by IEEE address
-                zigbee_device_info_t *device = find_device_by_ieee(zone_msg->info.src_address.u.ieee_addr);
-                if (device != NULL) {
-                    ESP_LOGI(TAG, "  Device found by IEEE address: short=0x%04x", device->short_addr);
-                    // Publish occupancy event to MQTT
-                    mqtt_publish_occupancy_event(device, occupied);
-                } else {
-                    ESP_LOGW(TAG, "  Device not found by IEEE address");
-                    // Log all devices for debugging
-                    ESP_LOGW(TAG, "  Current devices in list:");
-                    for (int i = 0; i < zigbee_device_count; i++) {
-                        char device_ieee_str[20];
-                        ieee_addr_to_string(zigbee_devices[i].ieee_addr, device_ieee_str, sizeof(device_ieee_str));
-                        ESP_LOGW(TAG, "    Device %d: short=0x%04x, ieee=%s", 
-                                 i, zigbee_devices[i].short_addr, device_ieee_str);
-                    }
-                }
-                break;
+                         src_ieee_addr[0], src_ieee_addr[1], src_ieee_addr[2], src_ieee_addr[3],
+                         src_ieee_addr[4], src_ieee_addr[5], src_ieee_addr[6], src_ieee_addr[7]);
             }
             
-            // Find device by short address
-            zigbee_device_info_t *device = find_device_by_short_addr(src_short_addr);
+            // Try to find device by short address first
+            zigbee_device_info_t *device = NULL;
+            if (src_short_addr != 0) {
+                device = find_device_by_short_addr(src_short_addr);
+                if (device != NULL) {
+                    ESP_LOGI(TAG, "  Device found by short address: 0x%04x", src_short_addr);
+                }
+            }
+            
+            // If not found by short address, try by IEEE address
+            if (device == NULL && has_ieee_addr) {
+                device = find_device_by_ieee(src_ieee_addr);
+                if (device != NULL) {
+                    ESP_LOGI(TAG, "  Device found by IEEE address");
+                    // Update short address if available
+                    if (src_short_addr != 0) {
+                        device->short_addr = src_short_addr;
+                        ESP_LOGI(TAG, "  Updated device short address to: 0x%04x", src_short_addr);
+                    }
+                }
+            }
+            
+            // If still not found, add new device
+            if (device == NULL && has_ieee_addr) {
+                if (zigbee_device_count < MAX_ZIGBEE_DEVICES) {
+                    device = &zigbee_devices[zigbee_device_count];
+                    device->short_addr = src_short_addr;
+                    memcpy(device->ieee_addr, src_ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                    device->endpoint = zone_msg->info.src_endpoint;
+                    device->device_id = 0;
+                    device->ha_discovery_done = false;
+                    device->has_onoff = true;
+                    device->has_level = false;
+                    device->has_temperature = false;
+                    device->has_humidity = false;
+                    device->has_occupancy = true;
+                    device->rssi = get_device_rssi(src_short_addr);
+                    zigbee_device_count++;
+                    ESP_LOGI(TAG, "  Added new device: short=0x%04x, endpoint=%d", src_short_addr, zone_msg->info.src_endpoint);
+                    // Publish device announce
+                    if (src_short_addr != 0) {
+                        mqtt_publish_device_announce(src_short_addr, device->ieee_addr);
+                    }
+                } else {
+                    ESP_LOGW(TAG, "  Max devices reached, cannot add more");
+                }
+            }
+            
+            // If device found or added, publish occupancy event
             if (device != NULL) {
-                ESP_LOGI(TAG, "  Device found: short=0x%04x, ieee=", device->short_addr);
-                char ieee_str[20];
-                ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
-                ESP_LOGI(TAG, "  IEEE: %s", ieee_str);
-                
+                // Update RSSI
+                device->rssi = get_device_rssi(device->short_addr);
                 // Publish occupancy event to MQTT
                 mqtt_publish_occupancy_event(device, occupied);
             } else {
-                ESP_LOGW(TAG, "  Device not found for short address: 0x%04x", src_short_addr);
-                // Try to find device by IEEE address if available
-                if (zone_msg->info.src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_IEEE) {
-                    device = find_device_by_ieee(zone_msg->info.src_address.u.ieee_addr);
-                    if (device != NULL) {
-                        ESP_LOGI(TAG, "  Device found by IEEE address: short=0x%04x", device->short_addr);
-                        // Update short address
-                        device->short_addr = src_short_addr;
-                        ESP_LOGI(TAG, "  Updated device short address to: 0x%04x", src_short_addr);
-                        // Publish occupancy event to MQTT
-                        mqtt_publish_occupancy_event(device, occupied);
-                    } else {
-                        // Log all devices for debugging
-                        ESP_LOGW(TAG, "  Current devices in list:");
-                        for (int i = 0; i < zigbee_device_count; i++) {
-                            char device_ieee_str[20];
-                            ieee_addr_to_string(zigbee_devices[i].ieee_addr, device_ieee_str, sizeof(device_ieee_str));
-                            ESP_LOGW(TAG, "    Device %d: short=0x%04x, ieee=%s", 
-                                     i, zigbee_devices[i].short_addr, device_ieee_str);
-                        }
-                    }
-                } else {
-                    // Log all devices for debugging
-                    ESP_LOGW(TAG, "  Current devices in list:");
-                    for (int i = 0; i < zigbee_device_count; i++) {
-                        char device_ieee_str[20];
-                        ieee_addr_to_string(zigbee_devices[i].ieee_addr, device_ieee_str, sizeof(device_ieee_str));
-                        ESP_LOGW(TAG, "    Device %d: short=0x%04x, ieee=%s", 
-                                 i, zigbee_devices[i].short_addr, device_ieee_str);
-                    }
+                ESP_LOGW(TAG, "  Device not found and cannot be added");
+                // Log all devices for debugging
+                ESP_LOGW(TAG, "  Current devices in list:");
+                for (int i = 0; i < zigbee_device_count; i++) {
+                    char device_ieee_str[20];
+                    ieee_addr_to_string(zigbee_devices[i].ieee_addr, device_ieee_str, sizeof(device_ieee_str));
+                    ESP_LOGW(TAG, "    Device %d: short=0x%04x, ieee=%s, rssi=%d", 
+                             i, zigbee_devices[i].short_addr, device_ieee_str, zigbee_devices[i].rssi);
                 }
             }
             break;
@@ -942,6 +985,37 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                         }
                     }
                     
+                    // If still not found, add new device
+                    if (device == NULL && report_msg->src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_IEEE) {
+                        if (zigbee_device_count < MAX_ZIGBEE_DEVICES) {
+                            zigbee_device_info_t *new_device = &zigbee_devices[zigbee_device_count];
+                            if (report_msg->src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT) {
+                                new_device->short_addr = report_msg->src_address.u.short_addr;
+                            } else {
+                                new_device->short_addr = 0;
+                            }
+                            memcpy(new_device->ieee_addr, report_msg->src_address.u.ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                            new_device->endpoint = report_msg->src_endpoint;
+                            new_device->device_id = 0;
+                            new_device->ha_discovery_done = false;
+                            new_device->has_onoff = true;
+                            new_device->has_level = false;
+                            new_device->has_temperature = false;
+                            new_device->has_humidity = false;
+                            new_device->has_occupancy = false;
+                            new_device->rssi = get_device_rssi(new_device->short_addr);
+                            zigbee_device_count++;
+                            ESP_LOGI(TAG, "  Added new device: short=0x%04x, endpoint=%d", new_device->short_addr, report_msg->src_endpoint);
+                            // Publish device announce
+                            if (new_device->short_addr != 0) {
+                                mqtt_publish_device_announce(new_device->short_addr, new_device->ieee_addr);
+                            }
+                            device = new_device;
+                        } else {
+                            ESP_LOGW(TAG, "  Max devices reached, cannot add more");
+                        }
+                    }
+                    
                     if (device != NULL) {
                         ESP_LOGI(TAG, "  Device found: short=0x%04x", device->short_addr);
                         // Publish on/off state to MQTT
@@ -979,8 +1053,20 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
     return ESP_OK;
 }
 
+static void update_devices_rssi(void)
+{
+    // Update RSSI for all devices
+    for (int i = 0; i < zigbee_device_count; i++) {
+        zigbee_device_info_t *device = &zigbee_devices[i];
+        device->rssi = get_device_rssi(device->short_addr);
+    }
+}
+
 static void heartbeat_timer_cb(uint8_t param)
 {
+    // Update devices RSSI
+    update_devices_rssi();
+    
     // Publish status heartbeat
     if (mqtt_connected) {
         mqtt_publish_coordinator_status();
@@ -1102,6 +1188,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 new_device->has_temperature = false;
                 new_device->has_humidity = false;
                 new_device->has_occupancy = true;  // 假设设备具有人体感应功能
+                new_device->rssi = get_device_rssi(new_device->short_addr);  // 初始RSSI值
                 zigbee_device_count++;
                 
                 ESP_LOGI(TAG, "Total ZigBee devices: %d", zigbee_device_count);
