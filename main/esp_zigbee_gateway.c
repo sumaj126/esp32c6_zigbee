@@ -719,11 +719,10 @@ static void mqtt_publish_occupancy_event(zigbee_device_info_t *device, bool occu
     char topic[64];
     char payload[64];
     
-    // Publish to the device's main topic
+    // Publish to the device's main topic (only occupancy, not state)
     snprintf(topic, sizeof(topic), "%s/%s", MQTT_TOPIC_PREFIX, ieee_str);
-    snprintf(payload, sizeof(payload), "{\"occupancy\":%s,\"state\":\"%s\"}", 
-             occupied ? "true" : "false", 
-             occupied ? "ON" : "OFF");
+    snprintf(payload, sizeof(payload), "{\"occupancy\":%s}", 
+             occupied ? "true" : "false");
     
     int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
     ESP_LOGI(TAG, "Published occupancy event to MQTT: %s, msg_id=%d", occupied ? "occupied" : "not occupied", msg_id);
