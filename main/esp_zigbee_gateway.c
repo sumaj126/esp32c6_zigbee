@@ -868,7 +868,7 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
             break;
         }
         case ESP_ZB_CORE_REPORT_ATTR_CB_ID: {
-            // Handle attribute report (for Occupancy Sensing cluster)
+            // Handle attribute report
             const esp_zb_zcl_report_attr_message_t *report_msg = (
                 const esp_zb_zcl_report_attr_message_t *)message;
             
@@ -897,6 +897,45 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                         ESP_LOGI(TAG, "  Device found: short=0x%04x", device->short_addr);
                         // Publish occupancy event to MQTT
                         mqtt_publish_occupancy_event(device, occupied);
+                    } else {
+                        ESP_LOGW(TAG, "  Device not found by IEEE address");
+                    }
+                }
+            } 
+            // Check if it's an On/Off cluster report
+            else if (report_msg->cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
+                ESP_LOGI(TAG, "On/Off attribute report received");
+                ESP_LOGI(TAG, "  Source endpoint: %d", report_msg->src_endpoint);
+                ESP_LOGI(TAG, "  Cluster: 0x%04x", report_msg->cluster);
+                ESP_LOGI(TAG, "  Attribute ID: 0x%04x", report_msg->attribute.id);
+                
+                // Check if it's the On/Off attribute
+                if (report_msg->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
+                    // Get on/off value
+                    bool onoff = false;
+                    if (report_msg->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL) {
+                        onoff = *(bool *)report_msg->attribute.data.value;
+                    } else if (report_msg->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U8) {
+                        onoff = *(uint8_t *)report_msg->attribute.data.value;
+                    }
+                    
+                    ESP_LOGI(TAG, "  On/Off: %s", onoff ? "ON" : "OFF");
+                    
+                    // Find device by IEEE address
+                    zigbee_device_info_t *device = find_device_by_ieee(report_msg->src_address.u.ieee_addr);
+                    if (device != NULL) {
+                        ESP_LOGI(TAG, "  Device found: short=0x%04x", device->short_addr);
+                        // Publish on/off state to MQTT
+                        if (mqtt_connected && mqtt_client != NULL) {
+                            char ieee_str[20];
+                            ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+                            char topic[64];
+                            char payload[64];
+                            snprintf(topic, sizeof(topic), "%s/%s", MQTT_TOPIC_PREFIX, ieee_str);
+                            snprintf(payload, sizeof(payload), "{\"state\":\"%s\"}", onoff ? "ON" : "OFF");
+                            int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+                            ESP_LOGI(TAG, "Published On/Off state to MQTT: %s, msg_id=%d", onoff ? "ON" : "OFF", msg_id);
+                        }
                     } else {
                         ESP_LOGW(TAG, "  Device not found by IEEE address");
                     }
