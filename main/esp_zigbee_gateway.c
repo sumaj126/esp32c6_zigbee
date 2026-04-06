@@ -1206,6 +1206,20 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                     ESP_LOGI(TAG, "  Added new device: short=0x%04x, endpoint=%d", new_device->short_addr, zone_msg->info.src_endpoint);
                     // Publish device announce
                     mqtt_publish_device_announce(new_device->short_addr, new_device->ieee_addr);
+                    // Publish HA Discovery immediately
+                    if (mqtt_connected && mqtt_client != NULL) {
+                        ESP_LOGI(TAG, "Publishing HA Discovery for new device (from IAS Zone)");
+                        mqtt_publish_ha_discovery_for_sensor(new_device);
+                        mqtt_publish_ha_discovery_for_switch(new_device, 1);
+                        // Subscribe to device command topic
+                        char ieee_str[20];
+                        ieee_addr_to_string(new_device->ieee_addr, ieee_str, sizeof(ieee_str));
+                        char topic[64];
+                        snprintf(topic, sizeof(topic), "%s/%s/set", MQTT_TOPIC_PREFIX, ieee_str);
+                        esp_mqtt_client_subscribe(mqtt_client, topic, 0);
+                        ESP_LOGI(TAG, "Subscribed to %s", topic);
+                        new_device->ha_discovery_done = true;
+                    }
                     device = new_device;
                 } else {
                     ESP_LOGW(TAG, "  Max devices reached, cannot add more");
@@ -1407,6 +1421,20 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                             // Publish device announce
                             if (new_device->short_addr != 0) {
                                 mqtt_publish_device_announce(new_device->short_addr, new_device->ieee_addr);
+                            }
+                            // Publish HA Discovery immediately
+                            if (mqtt_connected && mqtt_client != NULL) {
+                                ESP_LOGI(TAG, "Publishing HA Discovery for new device (from On/Off report)");
+                                mqtt_publish_ha_discovery_for_sensor(new_device);
+                                mqtt_publish_ha_discovery_for_switch(new_device, 1);
+                                // Subscribe to device command topic
+                                char ieee_str[20];
+                                ieee_addr_to_string(new_device->ieee_addr, ieee_str, sizeof(ieee_str));
+                                char topic[64];
+                                snprintf(topic, sizeof(topic), "%s/%s/set", MQTT_TOPIC_PREFIX, ieee_str);
+                                esp_mqtt_client_subscribe(mqtt_client, topic, 0);
+                                ESP_LOGI(TAG, "Subscribed to %s", topic);
+                                new_device->ha_discovery_done = true;
                             }
                             device = new_device;
                         } else {
