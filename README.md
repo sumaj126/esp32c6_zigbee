@@ -28,8 +28,10 @@
 - Home Assistant MQTT Discovery 自动发现
 - 断电离线检测（LWT 遗嘱消息）
 - 支持最多 10 个 ZigBee 子设备入网
-- 支持人体感应传感器和开关设备
+- 支持人体感应传感器和开关设备（单键/双键）
 - 实时状态监控和诊断信息
+- **设备白名单机制** - 只允许已知设备
+- **幽灵设备自动清理** - 心跳定时器自动删除无效设备
 
 ## 系统架构
 
@@ -119,6 +121,21 @@
 #define MAX_ZIGBEE_DEVICES              20          // 代码可管理的设备信息数
 #define ESP_ZB_PRIMARY_CHANNEL_MASK     (1l << 13)  // 通道 13
 #define ESP_ZB_GATEWAY_ENDPOINT         1           // 网关端点标识符
+```
+
+### 设备白名单配置
+
+在 `main/esp_zigbee_gateway.c` 中编辑 `is_device_in_whitelist()` 函数，添加或修改允许的设备 IEEE 地址：
+
+```c
+static bool is_device_in_whitelist(const zigbee_device_info_t *device)
+{
+    const uint8_t dual_switch_ieee[8] = { 0x8c, 0xf0, 0x6f, 0xd9, 0x59, 0x38, 0xc1, 0xa4 };
+    const uint8_t single_switch_ieee[8] = { 0x61, 0x23, 0xa5, 0x36, 0x59, 0x38, 0xc1, 0xa4 };
+    
+    return (memcmp(device->ieee_addr, dual_switch_ieee, 8) == 0 ||
+            memcmp(device->ieee_addr, single_switch_ieee, 8) == 0);
+}
 ```
 
 ## 代码架构
@@ -213,6 +230,7 @@ app_main()
                             │       └─→ 启动网络引导
                             │
                             ├─→ DEVICE_ANNCE:
+                            │       ├─→ 白名单检查
                             │       ├─→ 新设备入网
                             │       ├─→ 添加设备到列表
                             │       ├─→ 发布设备公告
@@ -223,6 +241,13 @@ app_main()
 ```
 
 ## 功能说明
+
+### 核心设计原则
+
+**重要：只有 Device Annce (ZDO) 可以创建设备！**
+- On/Off Report：只更新现有设备，**不创建新设备**
+- IAS Zone：只更新现有设备，**不创建新设备**
+- Device Annce：唯一可以创建设备的来源，通过白名单过滤
 
 ### 已实现功能
 
@@ -235,11 +260,13 @@ app_main()
 | 状态监控 | ✅ | 显示 online/offline 状态 |
 | LWT 遗嘱消息 | ✅ | 断电后约 15 秒显示 offline |
 | 设备入网公告 | ✅ | 新设备入网时发布 MQTT 消息 |
-| 心跳机制 | ✅ | 每 60 秒发布状态更新 |
+| 心跳机制 | ✅ | 每 60 秒发布状态更新 + 清理无效设备 |
 | 诊断信息 | ✅ | 重启原因、运行时间、剩余内存 |
 | 人体感应支持 | ✅ | 支持 IAS Zone 和 Occupancy Sensing 集群 |
-| 开关控制 | ✅ | 支持 On/Off 集群控制 |
+| 开关控制 | ✅ | 支持 On/Off 集群控制（单键/双键） |
 | MQTT 命令处理 | ✅ | 通过 MQTT 控制设备开关 |
+| 设备白名单 | ✅ | 只允许已知设备加入 |
+| 幽灵设备清理 | ✅ | 自动删除不在白名单的设备 |
 
 ### MQTT 话题
 
@@ -274,11 +301,14 @@ typedef struct {
     uint8_t endpoint;             // 设备端点
     uint16_t device_id;           // 设备 ID
     bool ha_discovery_done;       // HA Discovery 是否已完成
+    bool pending_confirmation;    // 是否等待 Device Annce 确认
+    int64_t created_time_ms;      // 设备创建时间
     bool has_onoff;               // 是否支持开关功能
     bool has_level;               // 是否支持亮度控制
     bool has_temperature;         // 是否支持温度传感器
     bool has_humidity;            // 是否支持湿度传感器
     bool has_occupancy;           // 是否支持人体感应
+    int8_t rssi;                  // 设备 RSSI
 } zigbee_device_info_t;
 ```
 
@@ -422,9 +452,11 @@ mosquitto_sub -h localhost -t 'homeassistant/sensor/zigbee_coordinator/#' -v
 | MQTT 连接失败 | 串口显示 "MQTT Disconnected from broker" | 检查 MQTT Broker IP 是否正确，确保 Mosquitto 服务运行 |
 | 设备无法入网 | 协调器不显示设备公告 | 确认入网窗口是否打开（启动后180秒内），检查设备是否处于配对模式 |
 | 设备显示但无数据 | HA 中设备显示但无状态更新 | 检查设备是否正常工作，查看串口是否有属性报告 |
-| 自定义集群错误 | 串口显示 "Received TO_CLI custom command, but cannot find the custom client cluster (0xef00)" | 这是正常的，不影响核心功能，是设备发送的厂商自定义命令 |
+| 自定义集群错误 | 串口显示 "Received TO_CLI custom command, cannot find the custom client cluster (0xef00)" | 这是正常的，不影响核心功能，是设备发送的厂商自定义命令 |
 | MQTT 命令无响应 | 发送命令后设备无反应 | 检查 IEEE 地址格式是否正确，确保设备已正确添加到列表 |
 | 协调器离线 | HA 中显示协调器离线 | 检查电源连接，查看串口是否有重启信息 |
+| **幽灵设备** | HA 中出现无效设备 | 确保设备在白名单中，心跳定时器会自动清理 |
+| **设备被删除** | 真实设备被自动删除 | 检查白名单配置，确保设备 IEEE 地址在列表中 |
 
 ### 诊断命令
 
@@ -457,7 +489,9 @@ idf.py -p COM3 monitor
 3. **推荐修改点**：
    - `MQTT_TOPIC_PREFIX`：可根据需要修改为自定义前缀
    - `HEARTBEAT_INTERVAL_SEC`：可调整心跳间隔
+   - `PENDING_DEVICE_TIMEOUT_SEC`：可调整 PENDING 设备超时时间
    - 设备能力检测逻辑：可根据需要添加对其他集群的支持
+   - `is_device_in_whitelist()`：修改设备白名单
 
 ### 代码结构说明
 
@@ -469,6 +503,7 @@ idf.py -p COM3 monitor
 | 设备管理 | 负责设备的添加、查找和管理 | esp_zigbee_gateway.c:248-267 | 注意设备数量限制 |
 | 命令处理 | 负责处理 MQTT 命令 | esp_zigbee_gateway.c:299-366 | 注意 IEEE 地址解析 |
 | 事件处理 | 负责处理 ZigBee 事件 | esp_zigbee_gateway.c:736-980 | 注意事件类型处理 |
+| 白名单检查 | 设备白名单验证 | esp_zigbee_gateway.c:276-283 | 修改时添加新设备 |
 
 ## 恢复步骤
 
@@ -531,6 +566,7 @@ idf.py -p COM3 monitor
 2. 添加人体感应传感器支持（IAS Zone 和 Occupancy Sensing）
 3. 添加开关控制支持（On/Off 集群）
 4. 实现 MQTT 命令控制
+5. 添加双键开关支持（按 IEEE 地址检测）
 
 ### 阶段五：问题修复
 
@@ -545,6 +581,9 @@ idf.py -p COM3 monitor
 | 状态不更新 | 添加 60 秒心跳定时器 |
 | 无法诊断问题原因 | 添加重启原因、运行时间、剩余内存属性 |
 | 设备命令无响应 | 实现 IEEE 地址双向解析 |
+| 幽灵设备过多 | 添加白名单机制 + 心跳清理 |
+| 设备被误删 | 移除 On/Off Report/IAS Zone 的设备创建 |
+| 人体感应一直显示 ON | 添加初始 OFF 状态发布 |
 
 ## 后续开发
 
