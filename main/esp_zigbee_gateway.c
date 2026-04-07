@@ -61,12 +61,14 @@ typedef struct {
     uint8_t endpoint;
     uint16_t device_id;
     bool ha_discovery_done;
+    bool pending_confirmation;  // true = created by report, awaiting Device Annce confirmation
+    int64_t created_time_ms;    // Timestamp when device was created (for cleanup)
     bool has_onoff;
     bool has_level;
     bool has_temperature;
     bool has_humidity;
-    bool has_occupancy;  // 人体感应
-    int8_t rssi;  // 设备信号强度
+    bool has_occupancy;
+    int8_t rssi;
 } zigbee_device_info_t;
 
 static zigbee_device_info_t zigbee_devices[MAX_ZIGBEE_DEVICES];
@@ -79,6 +81,8 @@ static void send_onoff_command(zigbee_device_info_t *device, bool onoff, int end
 static zigbee_device_info_t* find_device_by_ieee(const esp_zb_ieee_addr_t ieee_addr);
 static zigbee_device_info_t* find_device_by_short_addr(uint16_t short_addr);
 static void ieee_addr_to_string(esp_zb_ieee_addr_t ieee_addr, char *buf, size_t buf_len);
+static void mqtt_publish_ha_discovery_for_sensor(zigbee_device_info_t *device);
+static void mqtt_publish_ha_discovery_for_switch(zigbee_device_info_t *device, int endpoint);
 static void query_device_simple_desc(uint16_t short_addr, uint8_t endpoint);
 static void simple_desc_resp_handler(esp_zb_zdp_status_t zdo_status, esp_zb_af_simple_desc_1_1_t *simple_desc, void *user_ctx);
 static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message);
@@ -148,29 +152,63 @@ static bool is_ieee_addr_corrupted(const esp_zb_ieee_addr_t ieee_addr)
     return false;
 }
 
+/* Check if an IEEE address looks valid (not a pseudo address) */
+/* A valid IEEE address should have some diversity, not too many 0x00 or 0xFF */
+static bool is_ieee_addr_looks_valid(const esp_zb_ieee_addr_t ieee_addr)
+{
+    // Count how many bytes are 0x00 or 0xFF
+    int trivial_count = 0;
+    for (int i = 0; i < 8; i++) {
+        if (ieee_addr[i] == 0x00 || ieee_addr[i] == 0xFF) {
+            trivial_count++;
+        }
+    }
+    // If more than 4 bytes are 0x00 or 0xFF, it's probably a pseudo address
+    return (trivial_count <= 4);
+}
+
 /* Check if an IEEE address is pseudo-address derived from short address */
-/* Support two patterns:
-   Pattern 1: last 2 bytes, when reversed, equal the short address
-   Example: ieee=a5365938c1a41fa2, short=0xa21f → last 2 bytes are 1f a2 → reversed is a2 1f = 0xa21f
-   Pattern 2: first 2 bytes, when reversed, equal the short address
-   Example: ieee=6123a5365938c1a4, short=0x2361 → first 2 bytes are 61 23 → reversed is 23 61 = 0x2361
- */
 static bool is_ieee_pseudo_from_short(const esp_zb_ieee_addr_t ieee_addr, uint16_t short_addr)
 {
-    // Extract bytes from short address
     uint8_t short_high = (short_addr >> 8) & 0xFF;
     uint8_t short_low = short_addr & 0xFF;
     
-    // Pattern 1: Check last 2 bytes (ieee_addr[6] and ieee_addr[7])
-    if (ieee_addr[6] == short_low && ieee_addr[7] == short_high) {
-        return true;
+    for (int i = 0; i < 7; i++) {
+        if (ieee_addr[i] == short_low && ieee_addr[i + 1] == short_high) {
+            return true;
+        }
     }
     
-    // Pattern 2: Check first 2 bytes (ieee_addr[0] and ieee_addr[1])
-    if (ieee_addr[0] == short_low && ieee_addr[1] == short_high) {
-        return true;
+    return false;
+}
+
+/* Check if an IEEE address is a byte rotation of any existing confirmed device */
+static bool is_ieee_rotation_of_existing(const esp_zb_ieee_addr_t new_addr)
+{
+    for (int dev_idx = 0; dev_idx < zigbee_device_count; dev_idx++) {
+        if (zigbee_devices[dev_idx].pending_confirmation) {
+            continue;
+        }
+        
+        const uint8_t *existing_addr = zigbee_devices[dev_idx].ieee_addr;
+        
+        for (int shift = 0; shift < 8; shift++) {
+            int match_count = 0;
+            for (int i = 0; i < 8; i++) {
+                if (new_addr[i] == existing_addr[(i + shift) % 8]) {
+                    match_count++;
+                }
+            }
+            if (match_count >= 6) {
+                char new_str[20], existing_str[20];
+                ieee_addr_to_string((uint8_t *)new_addr, new_str, sizeof(new_str));
+                ieee_addr_to_string((uint8_t *)existing_addr, existing_str, sizeof(existing_str));
+                ESP_LOGW(TAG, "  ROTATION DETECTED: '%s' is %d-byte rotation of existing '%s'",
+                         new_str, shift, existing_str);
+                return true;
+            }
+        }
     }
-    
     return false;
 }
 
@@ -195,6 +233,94 @@ static void debug_print_all_devices(const char *label)
                  i, zigbee_devices[i].short_addr, device_ieee, zigbee_devices[i].endpoint);
     }
     ESP_LOGI(TAG, "=== END DEVICE LIST ===");
+}
+
+#define PENDING_AUTO_CONFIRM_SEC 30   // 30s: auto-confirm and publish HA Discovery
+#define PENDING_DEVICE_TIMEOUT_SEC 120 // 120s: remove if still unconfirmed
+
+static void publish_ha_for_device(zigbee_device_info_t *device)
+{
+    if (!mqtt_connected || mqtt_client == NULL || device->ha_discovery_done) {
+        return;
+    }
+    
+    char ieee_str[20];
+    ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+    
+    mqtt_publish_ha_discovery_for_sensor(device);
+    mqtt_publish_ha_discovery_for_switch(device, 1);
+    
+    char topic[64];
+    snprintf(topic, sizeof(topic), "%s/%s/set", MQTT_TOPIC_PREFIX, ieee_str);
+    esp_mqtt_client_subscribe(mqtt_client, topic, 0);
+    ESP_LOGI(TAG, "  ✓ Published HA Discovery for confirmed device: %s", ieee_str);
+    
+    const uint8_t dual_switch_ieee[8] = { 0x8c, 0xf0, 0x6f, 0xd9, 0x59, 0x38, 0xc1, 0xa4 };
+    if (memcmp(device->ieee_addr, dual_switch_ieee, 8) == 0) {
+        mqtt_publish_ha_discovery_for_switch(device, 2);
+        snprintf(topic, sizeof(topic), "%s/%s_2/set", MQTT_TOPIC_PREFIX, ieee_str);
+        esp_mqtt_client_subscribe(mqtt_client, topic, 0);
+    }
+    
+    device->ha_discovery_done = true;
+    
+    // Publish initial OFF state to occupancy topic
+    if (mqtt_connected && mqtt_client != NULL) {
+        char topic[64];
+        snprintf(topic, sizeof(topic), "%s/%s/occupancy", MQTT_TOPIC_PREFIX, ieee_str);
+        int msg_id = esp_mqtt_client_publish(mqtt_client, topic, "OFF", 0, 1, 0);
+        ESP_LOGI(TAG, "  Published initial OFF state to occupancy topic: msg_id=%d", msg_id);
+    }
+}
+
+static bool is_device_in_whitelist(const zigbee_device_info_t *device)
+{
+    const uint8_t dual_switch_ieee[8] = { 0x8c, 0xf0, 0x6f, 0xd9, 0x59, 0x38, 0xc1, 0xa4 };
+    const uint8_t single_switch_ieee[8] = { 0x61, 0x23, 0xa5, 0x36, 0x59, 0x38, 0xc1, 0xa4 };
+    
+    return (memcmp(device->ieee_addr, dual_switch_ieee, 8) == 0 ||
+            memcmp(device->ieee_addr, single_switch_ieee, 8) == 0);
+}
+
+static void cleanup_pending_devices(void)
+{
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    int removed = 0;
+    
+    for (int i = zigbee_device_count - 1; i >= 0; i--) {
+        bool is_pending = zigbee_devices[i].pending_confirmation;
+        int64_t age_sec = now_ms - zigbee_devices[i].created_time_ms;
+        bool in_whitelist = is_device_in_whitelist(&zigbee_devices[i]);
+        
+        char ieee_str[20];
+        ieee_addr_to_string(zigbee_devices[i].ieee_addr, ieee_str, sizeof(ieee_str));
+        
+        if (!in_whitelist) {
+            ESP_LOGW(TAG, "  🗑 REMOVING device NOT in whitelist: short=0x%04x, ieee='%s'",
+                     zigbee_devices[i].short_addr, ieee_str);
+            
+            for (int j = i; j < zigbee_device_count - 1; j++) {
+                zigbee_devices[j] = zigbee_devices[j + 1];
+            }
+            memset(&zigbee_devices[zigbee_device_count - 1], 0, sizeof(zigbee_device_info_t));
+            zigbee_device_count--;
+            removed++;
+        } else if (is_pending && age_sec > PENDING_DEVICE_TIMEOUT_SEC) {
+            ESP_LOGW(TAG, "  🗑 REMOVING stale PENDING device (%lld sec old): short=0x%04x, ieee='%s'",
+                     age_sec, zigbee_devices[i].short_addr, ieee_str);
+            
+            for (int j = i; j < zigbee_device_count - 1; j++) {
+                zigbee_devices[j] = zigbee_devices[j + 1];
+            }
+            memset(&zigbee_devices[zigbee_device_count - 1], 0, sizeof(zigbee_device_info_t));
+            zigbee_device_count--;
+            removed++;
+        }
+    }
+    
+    if (removed > 0) {
+        ESP_LOGW(TAG, "Cleanup: %d removed. Total devices: %d", removed, zigbee_device_count);
+    }
 }
 
 /* User context for ZDO requests */
@@ -415,7 +541,8 @@ static void simple_desc_resp_handler(esp_zb_zdp_status_t zdo_status, esp_zb_af_s
         ESP_LOGI(TAG, "Subscribed to %s", topic);
         
         // For dual-key switch, also publish for endpoint 2
-        if (device->short_addr == 0x2361 || device->short_addr == 0x6af6) {
+        const uint8_t dual_switch_ieee[8] = { 0x8c, 0xf0, 0x6f, 0xd9, 0x59, 0x38, 0xc1, 0xa4 };
+        if (memcmp(device->ieee_addr, dual_switch_ieee, 8) == 0) {
             mqtt_publish_ha_discovery_for_switch(device, 2);
             snprintf(topic, sizeof(topic), "%s/%s_2/set", MQTT_TOPIC_PREFIX, ieee_str);
             esp_mqtt_client_subscribe(mqtt_client, topic, 0);
@@ -424,6 +551,16 @@ static void simple_desc_resp_handler(esp_zb_zdp_status_t zdo_status, esp_zb_af_s
     }
     // Mark discovery as done regardless of capabilities
     device->ha_discovery_done = true;
+    
+    // Publish initial OFF state to occupancy topic
+    if (device->has_occupancy && mqtt_connected && mqtt_client != NULL) {
+        char ieee_str[20];
+        ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+        char topic[64];
+        snprintf(topic, sizeof(topic), "%s/%s/occupancy", MQTT_TOPIC_PREFIX, ieee_str);
+        int msg_id = esp_mqtt_client_publish(mqtt_client, topic, "OFF", 0, 1, 0);
+        ESP_LOGI(TAG, "  Published initial OFF state to occupancy topic: msg_id=%d", msg_id);
+    }
 }
 
 /* Query device simple descriptor */
@@ -1147,83 +1284,8 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                     device->endpoint = zone_msg->info.src_endpoint;
                     ESP_LOGI(TAG, "  Updated endpoint to: %d", zone_msg->info.src_endpoint);
                 }
-            }
-            
-            // ★ IMPORTANT: Now IAS Zone can also create new devices!
-            // This is because Device Annce is sometimes not sent by devices!
-            if (device == NULL && (has_ieee_addr || src_short_addr != 0)) {
-                // ★ CHECK: Don't add device if IEEE is pseudo-address from short address!
-                bool skip_pseudo = false;
-                if (has_ieee_addr && is_ieee_pseudo_from_short(src_ieee_addr, src_short_addr)) {
-                    char bad_ieee_str[20];
-                    ieee_addr_to_string(src_ieee_addr, bad_ieee_str, sizeof(bad_ieee_str));
-                    ESP_LOGW(TAG, "  ★ SKIPPED: IEEE '%s' is pseudo-address from short 0x%04x!", 
-                             bad_ieee_str, src_short_addr);
-                    skip_pseudo = true;
-                }
-                
-                if (!skip_pseudo && zigbee_device_count < MAX_ZIGBEE_DEVICES) {
-                    // Add new device
-                    zigbee_device_info_t *new_device = &zigbee_devices[zigbee_device_count];
-                    new_device->short_addr = src_short_addr;
-                    
-                    // Use IEEE address if available and valid, otherwise generate pseudo address
-                    if (has_ieee_addr && is_ieee_addr_valid(src_ieee_addr)) {
-                        memcpy(new_device->ieee_addr, src_ieee_addr, sizeof(esp_zb_ieee_addr_t));
-                        char ieee_str[20];
-                        ieee_addr_to_string(new_device->ieee_addr, ieee_str, sizeof(ieee_str));
-                        ESP_LOGI(TAG, "  Adding new device with IEEE: %s (from IAS Zone)", ieee_str);
-                    } else {
-                        // Generate pseudo IEEE address (FF FE + short address)
-                        if (has_ieee_addr) {
-                            char bad_ieee[20];
-                            ieee_addr_to_string(src_ieee_addr, bad_ieee, sizeof(bad_ieee));
-                            ESP_LOGW(TAG, "  Invalid IEEE from IAS Zone: %s (using pseudo address)", bad_ieee);
-                        }
-                        // Pseudo IEEE address format: FF FE + short address (now using direct byte order!)
-                        // Displayed as: fffeXXXX00000000
-                        new_device->ieee_addr[0] = 0xFF;  // First byte (MSB first in direct format)
-                        new_device->ieee_addr[1] = 0xFE;
-                        new_device->ieee_addr[2] = (src_short_addr >> 8) & 0xFF;
-                        new_device->ieee_addr[3] = src_short_addr & 0xFF;
-                        new_device->ieee_addr[4] = 0x00;
-                        new_device->ieee_addr[5] = 0x00;
-                        new_device->ieee_addr[6] = 0x00;
-                        new_device->ieee_addr[7] = 0x00;
-                    }
-                    
-                    new_device->endpoint = zone_msg->info.src_endpoint;
-                    new_device->device_id = 0;
-                    new_device->ha_discovery_done = false;
-                    new_device->has_onoff = true;  // Assume device has on/off capability
-                    new_device->has_level = false;
-                    new_device->has_temperature = false;
-                    new_device->has_humidity = false;
-                    new_device->has_occupancy = true;  // IAS Zone means occupancy sensor
-                    new_device->rssi = get_device_rssi(new_device->short_addr);  // 初始RSSI值
-                    
-                    zigbee_device_count++;
-                    ESP_LOGI(TAG, "  Added new device: short=0x%04x, endpoint=%d", new_device->short_addr, zone_msg->info.src_endpoint);
-                    // Publish device announce
-                    mqtt_publish_device_announce(new_device->short_addr, new_device->ieee_addr);
-                    // Publish HA Discovery immediately
-                    if (mqtt_connected && mqtt_client != NULL) {
-                        ESP_LOGI(TAG, "Publishing HA Discovery for new device (from IAS Zone)");
-                        mqtt_publish_ha_discovery_for_sensor(new_device);
-                        mqtt_publish_ha_discovery_for_switch(new_device, 1);
-                        // Subscribe to device command topic
-                        char ieee_str[20];
-                        ieee_addr_to_string(new_device->ieee_addr, ieee_str, sizeof(ieee_str));
-                        char topic[64];
-                        snprintf(topic, sizeof(topic), "%s/%s/set", MQTT_TOPIC_PREFIX, ieee_str);
-                        esp_mqtt_client_subscribe(mqtt_client, topic, 0);
-                        ESP_LOGI(TAG, "Subscribed to %s", topic);
-                        new_device->ha_discovery_done = true;
-                    }
-                    device = new_device;
-                } else {
-                    ESP_LOGW(TAG, "  Max devices reached, cannot add more");
-                }
+            } else {
+                ESP_LOGW(TAG, "  Device not found, ignoring IAS Zone (waiting for Device Annce)");
             }
             
             // If device found, publish occupancy event
@@ -1303,6 +1365,13 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                     // Find device by IEEE address
                     zigbee_device_info_t *device = find_device_by_ieee(report_msg->src_address.u.ieee_addr);
                     if (device != NULL) {
+                        if (device->pending_confirmation) {
+                            device->pending_confirmation = false;
+                            device->created_time_ms = esp_timer_get_time() / 1000;
+                            ESP_LOGI(TAG, "  ✓ Auto-confirmed PENDING device by On/Off report: short=0x%04x", device->short_addr);
+                            publish_ha_for_device(device);
+                        }
+                        
                         ESP_LOGI(TAG, "  Device found: short=0x%04x", device->short_addr);
                         // Publish occupancy event to MQTT
                         mqtt_publish_occupancy_event(device, occupied);
@@ -1374,74 +1443,6 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                         }
                     }
                     
-                    // If still not found, add new device
-                    if (device == NULL) {
-                        // ★ CHECK: Don't add device if IEEE is pseudo-address from short address!
-                        // But only check if address type is IEEE!
-                        // If address type is SHORT, we generate our own pseudo IEEE (FF FE + short), which is allowed!
-                        bool skip_pseudo = false;
-                        if (report_msg->src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_IEEE) {
-                            if (is_ieee_pseudo_from_short(report_msg->src_address.u.ieee_addr, report_msg->src_address.u.short_addr)) {
-                                char bad_ieee_str[20];
-                                ieee_addr_to_string(report_msg->src_address.u.ieee_addr, bad_ieee_str, sizeof(bad_ieee_str));
-                                ESP_LOGW(TAG, "  ★ SKIPPED: IEEE '%s' is pseudo-address from short 0x%04x!", 
-                                         bad_ieee_str, report_msg->src_address.u.short_addr);
-                                skip_pseudo = true;
-                            }
-                        }
-                        
-                        if (!skip_pseudo && zigbee_device_count < MAX_ZIGBEE_DEVICES) {
-                            zigbee_device_info_t *new_device = &zigbee_devices[zigbee_device_count];
-                            if (report_msg->src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT) {
-                                new_device->short_addr = report_msg->src_address.u.short_addr;
-                                // Generate pseudo IEEE address: FF FE + short address
-                                new_device->ieee_addr[0] = 0xFF;
-                                new_device->ieee_addr[1] = 0xFE;
-                                new_device->ieee_addr[2] = (report_msg->src_address.u.short_addr >> 8) & 0xFF;
-                                new_device->ieee_addr[3] = report_msg->src_address.u.short_addr & 0xFF;
-                                new_device->ieee_addr[4] = 0x00;
-                                new_device->ieee_addr[5] = 0x00;
-                                new_device->ieee_addr[6] = 0x00;
-                                new_device->ieee_addr[7] = 0x00;
-                            } else {
-                                new_device->short_addr = 0;
-                                memcpy(new_device->ieee_addr, report_msg->src_address.u.ieee_addr, sizeof(esp_zb_ieee_addr_t));
-                            }
-                            new_device->endpoint = report_msg->src_endpoint;
-                            new_device->device_id = 0;
-                            new_device->ha_discovery_done = false;
-                            new_device->has_onoff = true;
-                            new_device->has_level = false;
-                            new_device->has_temperature = false;
-                            new_device->has_humidity = false;
-                            new_device->has_occupancy = false;
-                            new_device->rssi = get_device_rssi(new_device->short_addr);
-                            zigbee_device_count++;
-                            ESP_LOGI(TAG, "  Added new device: short=0x%04x, endpoint=%d", new_device->short_addr, report_msg->src_endpoint);
-                            // Publish device announce
-                            if (new_device->short_addr != 0) {
-                                mqtt_publish_device_announce(new_device->short_addr, new_device->ieee_addr);
-                            }
-                            // Publish HA Discovery immediately
-                            if (mqtt_connected && mqtt_client != NULL) {
-                                ESP_LOGI(TAG, "Publishing HA Discovery for new device (from On/Off report)");
-                                mqtt_publish_ha_discovery_for_sensor(new_device);
-                                mqtt_publish_ha_discovery_for_switch(new_device, 1);
-                                // Subscribe to device command topic
-                                char ieee_str[20];
-                                ieee_addr_to_string(new_device->ieee_addr, ieee_str, sizeof(ieee_str));
-                                char topic[64];
-                                snprintf(topic, sizeof(topic), "%s/%s/set", MQTT_TOPIC_PREFIX, ieee_str);
-                                esp_mqtt_client_subscribe(mqtt_client, topic, 0);
-                                ESP_LOGI(TAG, "Subscribed to %s", topic);
-                                new_device->ha_discovery_done = true;
-                            }
-                            device = new_device;
-                        } else {
-                            ESP_LOGW(TAG, "  Max devices reached, cannot add more");
-                        }
-                    }
-                    
                     if (device != NULL) {
                         ESP_LOGI(TAG, "  Device found: short=0x%04x", device->short_addr);
                         // Publish on/off state to MQTT - use source endpoint to determine topic
@@ -1497,7 +1498,8 @@ static void update_devices_rssi(void)
 
 static void heartbeat_timer_cb(uint8_t param)
 {
-    // Update devices RSSI
+    cleanup_pending_devices();
+    
     update_devices_rssi();
     
     // Publish status heartbeat
@@ -1626,108 +1628,67 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             }
 
             if (existing != NULL) {
-                // Device exists - check if current IEEE is corrupted before updating
                 char old_ieee[20];
                 ieee_addr_to_string(existing->ieee_addr, old_ieee, sizeof(old_ieee));
                 
-                bool zdo_ieee_valid = is_ieee_addr_valid(dev_annce_params->ieee_addr);
-                bool current_ieee_corrupted = is_ieee_addr_corrupted(existing->ieee_addr);
+                bool was_pending = existing->pending_confirmation;
                 
                 existing->short_addr = dev_annce_params->device_short_addr;
+                existing->pending_confirmation = false;
+                existing->created_time_ms = esp_timer_get_time() / 1000;
                 
-                // ★ SMART UPDATE: Only update IEEE if ZDO provides valid address OR current is corrupted
-                if (zdo_ieee_valid || current_ieee_corrupted) {
-                    memcpy(existing->ieee_addr, dev_annce_params->ieee_addr, sizeof(esp_zb_ieee_addr_t));
-                    
-                    char new_ieee[20];
-                    ieee_addr_to_string(existing->ieee_addr, new_ieee, sizeof(new_ieee));
-                    
-                    if (current_ieee_corrupted && zdo_ieee_valid) {
-                        ESP_LOGW(TAG, "  🔧 REPAIRED corrupted IEEE: %s -> %s (from ZDO Device Annce)", old_ieee, new_ieee);
-                    } else {
-                        ESP_LOGI(TAG, "  Updated existing device: old_ieee=%s -> new_ieee=%s", old_ieee, new_ieee);
-                    }
-                    
-                    // Re-publish HA Discovery with updated (correct) IEEE address
-                    if (mqtt_connected && mqtt_client != NULL) {
-                        mqtt_publish_ha_discovery_for_sensor(existing);
-                        mqtt_publish_ha_discovery_for_switch(existing, 1);
-                        char topic[64];
-                        snprintf(topic, sizeof(topic), "%s/%s/set", MQTT_TOPIC_PREFIX, new_ieee);
-                        esp_mqtt_client_subscribe(mqtt_client, topic, 0);
-                        ESP_LOGI(TAG, "  Re-published HA Discovery and subscribed to %s", topic);
-                    }
-                } else {
-                    ESP_LOGI(TAG, "  Kept existing IEEE (ZDO IEEE invalid or same): %s", old_ieee);
+                memcpy(existing->ieee_addr, dev_annce_params->ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                
+                char new_ieee[20];
+                ieee_addr_to_string(existing->ieee_addr, new_ieee, sizeof(new_ieee));
+                
+                ESP_LOGI(TAG, "  ✓ Device CONFIRMED by ZDO: %s (was %s)", new_ieee, 
+                         was_pending ? "PENDING" : "known");
+                
+                if (memcmp(old_ieee, new_ieee, sizeof(old_ieee)) != 0 || was_pending) {
+                    publish_ha_for_device(existing);
                 }
             } else if (zigbee_device_count < MAX_ZIGBEE_DEVICES) {
-                // ★ CHECK: Don't add device if IEEE is pseudo-address from short address!
-                if (is_ieee_pseudo_from_short(dev_annce_params->ieee_addr, dev_annce_params->device_short_addr)) {
-                    char bad_ieee_str[20];
-                    ieee_addr_to_string(dev_annce_params->ieee_addr, bad_ieee_str, sizeof(bad_ieee_str));
-                    ESP_LOGW(TAG, "  ★ SKIPPED: IEEE '%s' is pseudo-address from short 0x%04x!", 
-                             bad_ieee_str, dev_annce_params->device_short_addr);
+                // ★ WHITELIST CHECK: Only allow known devices!
+                zigbee_device_info_t temp_device;
+                memcpy(temp_device.ieee_addr, dev_annce_params->ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                
+                if (!is_device_in_whitelist(&temp_device)) {
+                    char temp_ieee_str[20];
+                    ieee_addr_to_string(dev_annce_params->ieee_addr, temp_ieee_str, sizeof(temp_ieee_str));
+                    ESP_LOGW(TAG, "  ★ SKIPPED: Device IEEE '%s' NOT in whitelist!", temp_ieee_str);
                 } else {
-                // ★ TEMP DEBUG: REMOVED ALL FILTERS - let's see what devices are really there!
-                // Add new device
-                zigbee_device_info_t *new_device = &zigbee_devices[zigbee_device_count];
-                new_device->short_addr = dev_annce_params->device_short_addr;
-                memcpy(new_device->ieee_addr, dev_annce_params->ieee_addr, sizeof(esp_zb_ieee_addr_t));
-                new_device->endpoint = 1;  // Default to endpoint 1
-                new_device->device_id = 0;
-                new_device->ha_discovery_done = false;
-                new_device->has_onoff = true;  // Assume device has on/off capability
-                new_device->has_level = false;
-                new_device->has_temperature = false;
-                new_device->has_humidity = false;
-                new_device->has_occupancy = true;  // 假设设备具有人体感应功能
-                new_device->rssi = get_device_rssi(new_device->short_addr);  // 初始RSSI值
-                zigbee_device_count++;
+                    zigbee_device_info_t *new_device = &zigbee_devices[zigbee_device_count];
+                    new_device->short_addr = dev_annce_params->device_short_addr;
+                    memcpy(new_device->ieee_addr, dev_annce_params->ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                    new_device->endpoint = 1;
+                    new_device->device_id = 0;
+                    new_device->ha_discovery_done = false;
+                    new_device->pending_confirmation = false;  // ZDO is authoritative - immediately confirmed
+                    new_device->created_time_ms = esp_timer_get_time() / 1000;
+                    new_device->has_onoff = true;
+                    new_device->has_level = false;
+                    new_device->has_temperature = false;
+                    new_device->has_humidity = false;
+                    new_device->has_occupancy = true;
+                    new_device->rssi = get_device_rssi(new_device->short_addr);
+                    zigbee_device_count++;
 
-                ESP_LOGI(TAG, "Total ZigBee devices: %d", zigbee_device_count);
-                mqtt_publish_device_announce(dev_annce_params->device_short_addr, dev_annce_params->ieee_addr);
-
-                // Publish HA Discovery immediately (don't wait for simple descriptor)
-                // This ensures HA can discover the device right away
-                if (mqtt_connected && mqtt_client != NULL) {
-                    ESP_LOGI(TAG, "Publishing HA Discovery for new device (immediate)");
-                    mqtt_publish_ha_discovery_for_sensor(new_device);
-                    mqtt_publish_ha_discovery_for_switch(new_device, 1);
-                    // Subscribe to device command topic
                     char ieee_str[20];
                     ieee_addr_to_string(new_device->ieee_addr, ieee_str, sizeof(ieee_str));
-                    char topic[64];
-                    snprintf(topic, sizeof(topic), "%s/%s/set", MQTT_TOPIC_PREFIX, ieee_str);
-                    esp_mqtt_client_subscribe(mqtt_client, topic, 0);
-                    ESP_LOGI(TAG, "Subscribed to %s", topic);
-                    
-                    // For dual-key switch, also publish for endpoint 2
-                    if (new_device->short_addr == 0x2361 || new_device->short_addr == 0x6af6) {
-                        mqtt_publish_ha_discovery_for_switch(new_device, 2);
-                        snprintf(topic, sizeof(topic), "%s/%s_2/set", MQTT_TOPIC_PREFIX, ieee_str);
-                        esp_mqtt_client_subscribe(mqtt_client, topic, 0);
-                        ESP_LOGI(TAG, "Subscribed to %s", topic);
-                    }
-                    
-                    new_device->ha_discovery_done = true;
-                }
+                    ESP_LOGI(TAG, "Total ZigBee devices: %d", zigbee_device_count);
+                    ESP_LOGI(TAG, "  ✓ Added CONFIRMED device from ZDO: short=0x%04x, ieee='%s'", 
+                             new_device->short_addr, ieee_str);
+                    mqtt_publish_device_announce(dev_annce_params->device_short_addr, dev_annce_params->ieee_addr);
 
-                // Query device simple descriptor to detect capabilities (async, will update capabilities)
-                // Query endpoint 1 first (primary endpoint with IAS Zone and key 1)
-                ESP_LOGI(TAG, "Querying simple descriptor for device 0x%04x endpoint 1", dev_annce_params->device_short_addr);
-                query_device_simple_desc(dev_annce_params->device_short_addr, 1);
-                // Also query endpoint 2 for dual-key switches (second key)
-                ESP_LOGI(TAG, "Also querying endpoint 2 for potential second key");
-                query_device_simple_desc(dev_annce_params->device_short_addr, 2);
+                    publish_ha_for_device(new_device);
 
-                // Publish initial state for the new device (but don't force OFF, wait for actual state report)
-                // We'll let the device report its actual state via attribute report
+                    query_device_simple_desc(dev_annce_params->device_short_addr, 1);
+                    query_device_simple_desc(dev_annce_params->device_short_addr, 2);
                 }
             } else {
                 ESP_LOGW(TAG, "Max devices reached, cannot add more");
             }
-        } else {
-            ESP_LOGW(TAG, "Device announce parameters are NULL");
         }
         break;
     case ESP_ZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
