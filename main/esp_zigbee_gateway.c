@@ -290,22 +290,31 @@ static void cleanup_pending_devices(void)
     for (int i = zigbee_device_count - 1; i >= 0; i--) {
         bool is_pending = zigbee_devices[i].pending_confirmation;
         int64_t age_sec = now_ms - zigbee_devices[i].created_time_ms;
-        bool in_whitelist = is_device_in_whitelist(&zigbee_devices[i]);
         
         char ieee_str[20];
         ieee_addr_to_string(zigbee_devices[i].ieee_addr, ieee_str, sizeof(ieee_str));
         
-        if (!in_whitelist) {
-            ESP_LOGW(TAG, "  🗑 REMOVING device NOT in whitelist: short=0x%04x, ieee='%s'",
-                     zigbee_devices[i].short_addr, ieee_str);
-            
-            for (int j = i; j < zigbee_device_count - 1; j++) {
-                zigbee_devices[j] = zigbee_devices[j + 1];
+        // ★ FIX: Skip whitelist check for PENDING devices!
+        // PENDING devices use pseudo IEEE addresses (FF FE + short) that won't match whitelist
+        // Only apply whitelist check to CONFIRMED devices
+        if (!is_pending) {
+            bool in_whitelist = is_device_in_whitelist(&zigbee_devices[i]);
+            if (!in_whitelist) {
+                ESP_LOGW(TAG, "  🗑 REMOVING device NOT in whitelist: short=0x%04x, ieee='%s'",
+                         zigbee_devices[i].short_addr, ieee_str);
+                
+                for (int j = i; j < zigbee_device_count - 1; j++) {
+                    zigbee_devices[j] = zigbee_devices[j + 1];
+                }
+                memset(&zigbee_devices[zigbee_device_count - 1], 0, sizeof(zigbee_device_info_t));
+                zigbee_device_count--;
+                removed++;
+                continue;
             }
-            memset(&zigbee_devices[zigbee_device_count - 1], 0, sizeof(zigbee_device_info_t));
-            zigbee_device_count--;
-            removed++;
-        } else if (is_pending && age_sec > PENDING_DEVICE_TIMEOUT_SEC) {
+        }
+        
+        // Only remove stale PENDING devices (keep CONFIRMED devices forever)
+        if (is_pending && age_sec > PENDING_DEVICE_TIMEOUT_SEC) {
             ESP_LOGW(TAG, "  🗑 REMOVING stale PENDING device (%lld sec old): short=0x%04x, ieee='%s'",
                      age_sec, zigbee_devices[i].short_addr, ieee_str);
             
@@ -1284,11 +1293,41 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                     device->endpoint = zone_msg->info.src_endpoint;
                     ESP_LOGI(TAG, "  Updated endpoint to: %d", zone_msg->info.src_endpoint);
                 }
+            } else if (zigbee_device_count < MAX_ZIGBEE_DEVICES) {
+                // ★ TEMP FIX: Create PENDING device from IAS Zone if Device Annce missing
+                ESP_LOGW(TAG, "  Device not found, creating PENDING device from IAS Zone (waiting for Device Annce confirmation)");
+                zigbee_device_info_t *new_device = &zigbee_devices[zigbee_device_count];
+                new_device->short_addr = src_short_addr;
+                
+                // Generate pseudo IEEE address (FF FE + short address)
+                new_device->ieee_addr[0] = 0xFF;
+                new_device->ieee_addr[1] = 0xFE;
+                new_device->ieee_addr[2] = (src_short_addr >> 8) & 0xFF;
+                new_device->ieee_addr[3] = src_short_addr & 0xFF;
+                new_device->ieee_addr[4] = 0x00;
+                new_device->ieee_addr[5] = 0x00;
+                new_device->ieee_addr[6] = 0x00;
+                new_device->ieee_addr[7] = 0x00;
+                
+                new_device->endpoint = zone_msg->info.src_endpoint;
+                new_device->device_id = 0;
+                new_device->ha_discovery_done = false;
+                new_device->pending_confirmation = true;
+                new_device->created_time_ms = esp_timer_get_time() / 1000;
+                new_device->has_onoff = true;
+                new_device->has_level = false;
+                new_device->has_temperature = false;
+                new_device->has_humidity = false;
+                new_device->has_occupancy = true;
+                new_device->rssi = get_device_rssi(new_device->short_addr);
+                zigbee_device_count++;
+                device = new_device;
+                ESP_LOGI(TAG, "  Added PENDING device from IAS Zone: short=0x%04x (awaiting Device Annce confirmation)", new_device->short_addr);
             } else {
-                ESP_LOGW(TAG, "  Device not found, ignoring IAS Zone (waiting for Device Annce)");
+                ESP_LOGW(TAG, "  Device not found and max devices reached, ignoring IAS Zone");
             }
             
-            // If device found, publish occupancy event
+            // If device found or created, publish occupancy event
             if (device != NULL) {
                 // Update RSSI
                 device->rssi = get_device_rssi(device->short_addr);
@@ -1463,18 +1502,56 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
                             int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
                             ESP_LOGI(TAG, "Published On/Off state to MQTT: %s, topic=%s, msg_id=%d", onoff ? "ON" : "OFF", topic, msg_id);
                         }
-                    } else {
-                        ESP_LOGW(TAG, "  Device not found by IEEE address");
-                        // Log IEEE address for debugging
-                        ESP_LOGW(TAG, "  IEEE address: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
-                                 report_msg->src_address.u.ieee_addr[0], report_msg->src_address.u.ieee_addr[1],
-                                 report_msg->src_address.u.ieee_addr[2], report_msg->src_address.u.ieee_addr[3],
-                                 report_msg->src_address.u.ieee_addr[4], report_msg->src_address.u.ieee_addr[5],
-                                 report_msg->src_address.u.ieee_addr[6], report_msg->src_address.u.ieee_addr[7]);
-                        // Log short address if available
-                        if (report_msg->src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT) {
-                            ESP_LOGW(TAG, "  Short address: 0x%04x", report_msg->src_address.u.short_addr);
+                    } else if (zigbee_device_count < MAX_ZIGBEE_DEVICES && report_msg->src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT) {
+                        // ★ TEMP FIX: Create PENDING device from On/Off Report if Device Annce missing
+                        ESP_LOGW(TAG, "  Device not found, creating PENDING device from On/Off Report (waiting for Device Annce confirmation)");
+                        zigbee_device_info_t *new_device = &zigbee_devices[zigbee_device_count];
+                        new_device->short_addr = report_msg->src_address.u.short_addr;
+                        
+                        // Generate pseudo IEEE address (FF FE + short address)
+                        new_device->ieee_addr[0] = 0xFF;
+                        new_device->ieee_addr[1] = 0xFE;
+                        new_device->ieee_addr[2] = (report_msg->src_address.u.short_addr >> 8) & 0xFF;
+                        new_device->ieee_addr[3] = report_msg->src_address.u.short_addr & 0xFF;
+                        new_device->ieee_addr[4] = 0x00;
+                        new_device->ieee_addr[5] = 0x00;
+                        new_device->ieee_addr[6] = 0x00;
+                        new_device->ieee_addr[7] = 0x00;
+                        
+                        new_device->endpoint = report_msg->src_endpoint;
+                        new_device->device_id = 0;
+                        new_device->ha_discovery_done = false;
+                        new_device->pending_confirmation = true;
+                        new_device->created_time_ms = esp_timer_get_time() / 1000;
+                        new_device->has_onoff = true;
+                        new_device->has_level = false;
+                        new_device->has_temperature = false;
+                        new_device->has_humidity = false;
+                        new_device->has_occupancy = true;
+                        new_device->rssi = get_device_rssi(new_device->short_addr);
+                        zigbee_device_count++;
+                        device = new_device;
+                        ESP_LOGI(TAG, "  Added PENDING device from On/Off Report: short=0x%04x (awaiting Device Annce confirmation)", new_device->short_addr);
+                        
+                        // Publish on/off state to MQTT
+                        if (mqtt_connected && mqtt_client != NULL) {
+                            char ieee_str[20];
+                            ieee_addr_to_string(device->ieee_addr, ieee_str, sizeof(ieee_str));
+                            char topic[64];
+                            char payload[64];
+                            
+                            if (report_msg->src_endpoint == 1) {
+                                snprintf(topic, sizeof(topic), "%s/%s", MQTT_TOPIC_PREFIX, ieee_str);
+                            } else {
+                                snprintf(topic, sizeof(topic), "%s/%s_%d", MQTT_TOPIC_PREFIX, ieee_str, report_msg->src_endpoint);
+                            }
+                            
+                            snprintf(payload, sizeof(payload), "{\"state\":\"%s\"}", onoff ? "ON" : "OFF");
+                            int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+                            ESP_LOGI(TAG, "Published On/Off state to MQTT: %s, topic=%s, msg_id=%d", onoff ? "ON" : "OFF", topic, msg_id);
                         }
+                    } else {
+                        ESP_LOGW(TAG, "  Device not found and max devices reached, ignoring On/Off Report");
                     }
                 }
             }
@@ -1796,12 +1873,6 @@ void app_main(void)
 {
     // Set log level for custom cluster module to reduce error messages
     esp_log_level_set("ESP_ZIGBEE_ZCL_CUSTOM_CLUSTER", ESP_LOG_WARN);
-
-    // ★ CRITICAL: Clear all cached device data to fix stale IEEE address issue
-    // This forces rediscovery of all devices with correct addresses
-    zigbee_device_count = 0;
-    memset(zigbee_devices, 0, sizeof(zigbee_devices));
-    ESP_LOGI(TAG, "Cleared all cached device data - will rediscover from scratch");
 
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
